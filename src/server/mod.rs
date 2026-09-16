@@ -76,7 +76,7 @@ pub async fn serve(db: Db, cfg: Config, bind: &str) -> Result<()> {
    price_history(&state).await;
    let price_state = state.clone();
    tokio::spawn(async move {
-      let mut tick = time::interval(Duration::from_hours(12));
+      let mut tick = time::interval(Duration::from_secs(12 * 60 * 60));
       tick.tick().await;
       loop {
          tick.tick().await;
@@ -87,7 +87,7 @@ pub async fn serve(db: Db, cfg: Config, bind: &str) -> Result<()> {
    });
    let reload_state = state.clone();
    tokio::spawn(async move {
-      let mut tick = time::interval(Duration::from_mins(1));
+      let mut tick = time::interval(Duration::from_secs(60));
       tick.tick().await;
       loop {
          tick.tick().await;

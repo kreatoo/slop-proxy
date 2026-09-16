@@ -121,6 +121,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
       "TEXT NOT NULL DEFAULT ''",
    ),
    ("api_tokens", "pinned_account", "INTEGER"),
+   ("api_tokens", "five_hour_limit", "REAL"),
+   ("api_tokens", "weekly_limit", "REAL"),
 ];
 
 /// Indexes over columns `ADDED_COLUMNS` introduces, so they are built after
@@ -149,6 +151,7 @@ fn add_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result
 #[cfg(test)]
 mod tests {
    use super::*;
+   use crate::db::tokens::TokenLimits;
    use crate::db::usage::UsageRecord;
    use std::env;
    use std::time::Duration;
@@ -156,6 +159,25 @@ mod tests {
 
    fn database() -> Db {
       Db::open(&env::temp_dir().join(format!("slop-db-{}.db", uuid::Uuid::new_v4()))).unwrap()
+   }
+
+   #[tokio::test]
+   async fn token_codex_limits_round_trip() {
+      let db = database();
+      let id = db.create_token("alice", "secret", "test").await.unwrap();
+      db.set_token_limits(
+         &id.to_string(),
+         &TokenLimits {
+            five_hour_limit: Some(0.5),
+            weekly_limit: Some(0.75),
+            ..TokenLimits::default()
+         },
+      )
+      .await
+      .unwrap();
+      let token = db.auth_token("secret").await.unwrap().unwrap();
+      assert_eq!(token.limits.five_hour_limit, Some(0.5));
+      assert_eq!(token.limits.weekly_limit, Some(0.75));
    }
 
    #[tokio::test]

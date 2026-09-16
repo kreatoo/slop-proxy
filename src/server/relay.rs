@@ -271,6 +271,8 @@ pub async fn messages(
       user: &auth.user,
       pinned_account: auth.limits.pinned_account,
       prefer_trusted: false,
+      five_hour_limit: None,
+      weekly_limit: None,
    };
    let body = normalized_body(&body, &peek);
    let result = match provider {
@@ -418,6 +420,8 @@ pub async fn count_tokens(
             user: &auth.user,
             pinned_account: auth.limits.pinned_account,
             prefer_trusted: false,
+      five_hour_limit: None,
+      weekly_limit: None,
          },
          AnthropicRelay {
             path: "/v1/messages/count_tokens",

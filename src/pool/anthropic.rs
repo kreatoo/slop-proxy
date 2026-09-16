@@ -165,6 +165,8 @@ mod tests {
             user: "",
             pinned_account: None,
             prefer_trusted: false,
+      five_hour_limit: None,
+      weekly_limit: None,
          })
          .await
    }

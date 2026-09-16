@@ -396,6 +396,41 @@ impl Slots {
          .unwrap_or_default()
    }
 
+   /// Returns false only when a reported Codex window has reached its token cap.
+   /// An unreported window is left unconstrained, which keeps fresh accounts
+   /// usable and lets plans that omit a five-hour window work normally.
+   pub async fn within_quota_limits(
+      &self,
+      slot: &Slot,
+      five_hour_limit: Option<f64>,
+      weekly_limit: Option<f64>,
+   ) -> bool {
+      if five_hour_limit.is_none() && weekly_limit.is_none() {
+         return true;
+      }
+      let state = slot.state.lock().await;
+      let Some(usage) = state.usage.as_ref() else {
+         return true;
+      };
+      Self::quota_allows(usage, five_hour_limit, weekly_limit)
+   }
+
+   fn quota_allows(
+      usage: &AccountUsage,
+      five_hour_limit: Option<f64>,
+      weekly_limit: Option<f64>,
+   ) -> bool {
+      usage.windows.iter().all(|window| {
+         let seconds = window_seconds(&window.name);
+         let limit = match seconds {
+            Some(18_000) => five_hour_limit,
+            Some(604_800) => weekly_limit,
+            _ => None,
+         };
+         limit.is_none_or(|limit| window.utilization < limit)
+      })
+   }
+
    /// Where the account sits relative to a level burn of its windows.
    /// Accounts with no usage report yet are assumed healthy so a fresh
    /// account is not held back before it has served anything.
@@ -924,5 +959,24 @@ mod idle_window_tests {
          observed_at: 0,
       };
       assert_eq!(usage_data.band(0.9, now), Band::Spent);
+   }
+}
+
+#[cfg(test)]
+mod quota_tests {
+   use super::*;
+
+   #[test]
+   fn each_codex_window_is_checked_only_when_configured() {
+      let usage = AccountUsage {
+         windows: vec![
+            UsageWindow { name: "5h".into(), utilization: 0.5, resets_at: None },
+            UsageWindow { name: "7d".into(), utilization: 0.2, resets_at: None },
+         ],
+         ..AccountUsage::default()
+      };
+      assert!(!Slots::quota_allows(&usage, Some(0.5), None));
+      assert!(Slots::quota_allows(&usage, None, Some(0.5)));
+      assert!(Slots::quota_allows(&usage, None, None));
    }
 }

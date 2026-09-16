@@ -1,0 +1,15 @@
+services:
+  slop-proxy:
+    image: ghcr.io/kreatoo/slop-proxy:latest
+    container_name: slop-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8484:8484"
+    volumes:
+      - ./data:/data
+    command:
+      - --db
+      - /data/.local/share/slop-proxy/slop.db
+      - serve
+      - --bind
+      - 0.0.0.0:8484

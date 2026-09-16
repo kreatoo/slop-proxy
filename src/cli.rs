@@ -130,6 +130,12 @@ pub enum TokenCommand {
       /// Maximum input plus output tokens in each rolling window
       #[pound(long)]
       tokens: Option<i64>,
+      /// Maximum Codex five-hour quota utilization, such as 50%
+      #[pound(long = "5hr-limit")]
+      five_hour_limit: Option<String>,
+      /// Maximum Codex weekly quota utilization, such as 50%
+      #[pound(long)]
+      weekly_limit: Option<String>,
       #[pound(long, default = "3600")]
       window_seconds: i64,
       /// Delay every admitted request by this many milliseconds
@@ -156,6 +162,12 @@ pub enum TokenCommand {
       requests: Option<i64>,
       #[pound(long)]
       tokens: Option<i64>,
+      /// Maximum Codex five-hour quota utilization, such as 50%
+      #[pound(long = "5hr-limit")]
+      five_hour_limit: Option<String>,
+      /// Maximum Codex weekly quota utilization, such as 50%
+      #[pound(long)]
+      weekly_limit: Option<String>,
       #[pound(long, default = "3600")]
       window_seconds: i64,
       #[pound(long, default = "0")]
@@ -227,6 +239,8 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             user,
             requests,
             tokens,
+            five_hour_limit,
+            weekly_limit,
             window_seconds,
             slowdown_ms,
             prefer_trusted,
@@ -236,6 +250,8 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             let limits = token_limits(
                requests,
                tokens,
+               five_hour_limit,
+               weekly_limit,
                window_seconds,
                slowdown_ms,
                prefer_trusted,
@@ -250,6 +266,8 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             token,
             requests,
             tokens,
+            five_hour_limit,
+            weekly_limit,
             window_seconds,
             slowdown_ms,
             prefer_trusted,
@@ -259,6 +277,8 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             let limits = token_limits(
                requests,
                tokens,
+               five_hour_limit,
+               weekly_limit,
                window_seconds,
                slowdown_ms,
                prefer_trusted,
@@ -428,6 +448,8 @@ async fn resolve_pin(db: &Db, account: Option<String>) -> Result<Option<i64>> {
 fn token_limits(
    requests: Option<i64>,
    tokens: Option<i64>,
+   five_hour_limit: Option<String>,
+   weekly_limit: Option<String>,
    window_seconds: i64,
    slowdown_ms: i64,
    prefer_trusted: bool,
@@ -446,6 +468,8 @@ fn token_limits(
    if slowdown_ms < 0 {
       bail!("--slowdown-ms cannot be negative");
    }
+   let five_hour_limit = parse_percentage(five_hour_limit, "--5hr-limit")?;
+   let weekly_limit = parse_percentage(weekly_limit, "--weekly-limit")?;
    let providers = providers
       .filter(|csv| !csv.trim().is_empty())
       .map(|raw| {
@@ -462,10 +486,27 @@ fn token_limits(
       tokens,
       window_seconds,
       slowdown_ms,
+      five_hour_limit,
+      weekly_limit,
       prefer_trusted,
       pinned_account,
       providers,
    })
+}
+
+fn parse_percentage(raw: Option<String>, flag: &str) -> Result<Option<f64>> {
+   let Some(raw) = raw else {
+      return Ok(None);
+   };
+   let value = raw
+      .strip_suffix('%')
+      .ok_or_else(|| eyre!("{flag} must be a percentage such as 50%"))?
+      .parse::<f64>()
+      .map_err(|_| eyre!("{flag} must be a percentage such as 50%"))?;
+   if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+      bail!("{flag} must be between 0% and 100%");
+   }
+   Ok(Some(value / 100.0))
 }
 
 async fn token_set_limits(db: &Db, token: &str, limits: &TokenLimits) -> Result<()> {
@@ -496,6 +537,8 @@ async fn token_list(db: &Db) -> Result<()> {
       revoked_at: Option<i64>,
       request_limit: Option<i64>,
       token_limit: Option<i64>,
+      five_hour_limit: Option<f64>,
+      weekly_limit: Option<f64>,
       window_seconds: i64,
       slowdown_ms: i64,
    }
@@ -512,6 +555,8 @@ async fn token_list(db: &Db) -> Result<()> {
          revoked_at: token.revoked_at,
          request_limit: token.limits.requests,
          token_limit: token.limits.tokens,
+         five_hour_limit: token.limits.five_hour_limit,
+         weekly_limit: token.limits.weekly_limit,
          window_seconds: token.limits.window_seconds,
          slowdown_ms: token.limits.slowdown_ms,
       })
@@ -578,4 +623,54 @@ async fn debug_refresh(db: &Db, account: &str) -> Result<()> {
       acc.email.as_deref().unwrap_or("-")
    );
    Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+   use super::{Cli, Command, TokenCommand, parse_percentage};
+   use pound::Parse as _;
+
+   #[test]
+   fn token_create_accepts_codex_percentage_flags() {
+      let cli = Cli::try_parse_from([
+         "token",
+         "create",
+         "--user",
+         "alice",
+         "--5hr-limit",
+         "50%",
+         "--weekly-limit",
+         "50%",
+      ])
+      .unwrap();
+      let Command::Token {
+         command: TokenCommand::Create {
+            five_hour_limit,
+            weekly_limit,
+            ..
+         },
+      } = cli.command
+      else {
+         panic!("expected token create");
+      };
+      assert_eq!(five_hour_limit.as_deref(), Some("50%"));
+      assert_eq!(weekly_limit.as_deref(), Some("50%"));
+   }
+
+   #[test]
+   fn codex_percentages_are_stored_as_fractions() {
+      assert_eq!(
+         parse_percentage(Some("50%".into()), "--5hr-limit").unwrap(),
+         Some(0.5)
+      );
+      assert_eq!(parse_percentage(None, "--5hr-limit").unwrap(), None);
+   }
+
+   #[test]
+   fn codex_percentages_must_be_bounded_and_marked() {
+      assert!(parse_percentage(Some("50".into()), "--weekly-limit").is_err());
+      assert!(parse_percentage(Some("101%".into()), "--weekly-limit").is_err());
+      assert!(parse_percentage(Some("-1%".into()), "--weekly-limit").is_err());
+   }
 }

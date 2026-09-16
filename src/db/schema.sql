@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   token_prefix   TEXT    NOT NULL,
   request_limit  INTEGER,
   token_limit    INTEGER,
+  five_hour_limit REAL,
+  weekly_limit   REAL,
   window_seconds INTEGER NOT NULL DEFAULT 3600,
   slowdown_ms    INTEGER NOT NULL DEFAULT 0,
   prefer_trusted INTEGER NOT NULL DEFAULT 0,

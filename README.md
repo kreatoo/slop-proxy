@@ -124,3 +124,11 @@ race past the request limit. A request that takes the token total over its
 limit completes, and later requests get `429` until usage rolls out of the
 window. Responses carry `x-ratelimit-*` headers, and limit errors include
 `retry-after`.
+
+Codex tokens may also be capped against the provider-reported subscription
+windows. Values use percentages; omit either flag to leave that window
+unlimited. If Codex does not report a configured window, that check is skipped.
+
+```sh
+slop-proxy token create --user alice --5hr-limit 50% --weekly-limit 50%
+```

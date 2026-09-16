@@ -79,6 +79,8 @@ pub async fn messages(
       user: &auth.user,
       pinned_account: auth.limits.pinned_account,
       prefer_trusted: auth.limits.prefer_trusted,
+      five_hour_limit: auth.limits.five_hour_limit,
+      weekly_limit: auth.limits.weekly_limit,
    };
    let Dispatched {
       account_id,

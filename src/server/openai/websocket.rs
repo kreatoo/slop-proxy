@@ -73,6 +73,8 @@ pub async fn responses(
       user: &auth.user,
       pinned_account: auth.limits.pinned_account,
       prefer_trusted: auth.limits.prefer_trusted,
+      five_hour_limit: auth.limits.five_hour_limit,
+      weekly_limit: auth.limits.weekly_limit,
    };
    let (account_id, upstream) = match state.pools.codex.websocket(route, headers.clone()).await {
       Ok(connection) => connection,
@@ -215,6 +217,8 @@ impl Relay {
          user: &auth.user,
          pinned_account: auth.limits.pinned_account,
          prefer_trusted: auth.limits.prefer_trusted,
+         five_hour_limit: auth.limits.five_hour_limit,
+         weekly_limit: auth.limits.weekly_limit,
       };
       let serves = self
          .state

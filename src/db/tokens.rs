@@ -21,6 +21,10 @@ pub struct TokenLimits {
    pub tokens: Option<i64>,
    pub window_seconds: i64,
    pub slowdown_ms: i64,
+   /// Maximum Codex 5-hour quota utilization allowed for this token.
+   pub five_hour_limit: Option<f64>,
+   /// Maximum Codex 7-day quota utilization allowed for this token.
+   pub weekly_limit: Option<f64>,
    pub prefer_trusted: bool,
    /// The one account this token may be served by. `None` leaves it free to
    /// use any account the pool offers.
@@ -89,8 +93,9 @@ impl Db {
          .call(move |conn| {
             let mut stmt = conn.prepare(
                "SELECT id, user, token_prefix, created_at, revoked_at,
-                    request_limit, token_limit, window_seconds, slowdown_ms, prefer_trusted,
-                    pinned_account, allowed_providers
+                    request_limit, token_limit, window_seconds, slowdown_ms,
+                    five_hour_limit, weekly_limit, prefer_trusted, pinned_account,
+                    allowed_providers
              FROM api_tokens ORDER BY id",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -105,9 +110,11 @@ impl Db {
                      tokens: row.get(6)?,
                      window_seconds: row.get(7)?,
                      slowdown_ms: row.get(8)?,
-                     prefer_trusted: row.get(9)?,
-                     pinned_account: row.get(10)?,
-                     providers: TokenLimits::decode(&row.get::<_, String>(11)?),
+                     five_hour_limit: row.get(9)?,
+                     weekly_limit: row.get(10)?,
+                     prefer_trusted: row.get(11)?,
+                     pinned_account: row.get(12)?,
+                     providers: TokenLimits::decode(&row.get::<_, String>(13)?),
                   },
                })
             })?;
@@ -139,7 +146,8 @@ impl Db {
             Ok(conn.execute(
                "UPDATE api_tokens
              SET request_limit = ?3, token_limit = ?4, window_seconds = ?5, slowdown_ms = ?6,
-                 prefer_trusted = ?7, pinned_account = ?8, allowed_providers = ?9
+                 five_hour_limit = ?7, weekly_limit = ?8, prefer_trusted = ?9,
+                 pinned_account = ?10, allowed_providers = ?11
              WHERE id = ?1 OR token_prefix = ?2",
                params![
                   id,
@@ -148,6 +156,8 @@ impl Db {
                   limits.tokens,
                   limits.window_seconds,
                   limits.slowdown_ms,
+                  limits.five_hour_limit,
+                  limits.weekly_limit,
                   limits.prefer_trusted,
                   limits.pinned_account,
                   limits.encode(),
@@ -163,7 +173,8 @@ impl Db {
          .call(move |conn| {
             let mut stmt = conn.prepare(
                "SELECT id, user, request_limit, token_limit, window_seconds, slowdown_ms,
-                    prefer_trusted, pinned_account, allowed_providers
+                    five_hour_limit, weekly_limit, prefer_trusted, pinned_account,
+                    allowed_providers
              FROM api_tokens WHERE token_hash = ?1 AND revoked_at IS NULL",
             )?;
             let mut rows = stmt.query_map(params![token_hash], |row| {
@@ -175,9 +186,11 @@ impl Db {
                      tokens: row.get(3)?,
                      window_seconds: row.get(4)?,
                      slowdown_ms: row.get(5)?,
-                     prefer_trusted: row.get(6)?,
-                     pinned_account: row.get(7)?,
-                     providers: TokenLimits::decode(&row.get::<_, String>(8)?),
+                     five_hour_limit: row.get(6)?,
+                     weekly_limit: row.get(7)?,
+                     prefer_trusted: row.get(8)?,
+                     pinned_account: row.get(9)?,
+                     providers: TokenLimits::decode(&row.get::<_, String>(10)?),
                   },
                })
             })?;

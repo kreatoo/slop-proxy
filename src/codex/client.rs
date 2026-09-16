@@ -260,38 +260,41 @@ impl CodexClient {
          )
          .await
       {
-         Err(SendError::BadRequest(body))
-            if body.contains("max_output_tokens")
-               && let Ok(mut retry) = serde_json::from_slice::<Retry>(req)
-               && retry.max_output_tokens.take().is_some()
-               && let Ok(retry) = serde_json::to_vec(&retry) =>
-         {
-            tracing::debug!("upstream rejected max_output_tokens; retrying without it");
-            self
-               .send_once(
-                  access_token,
-                  chatgpt_account_id,
-                  &Bytes::from(retry),
-                  session_id,
-                  model,
-                  headers,
-               )
-               .await
-         },
-         Err(SendError::BadRequest(body))
-            if body == UNDECRYPTABLE
-               && let Some(retry) = drop_undecryptable_payloads(req) =>
-         {
-            self
-               .send_once(
-                  access_token,
-                  chatgpt_account_id,
-                  &retry,
-                  session_id,
-                  model,
-                  headers,
-               )
-               .await
+         Err(SendError::BadRequest(body)) => {
+            if body.contains("max_output_tokens") {
+               if let Ok(mut retry) = serde_json::from_slice::<Retry>(req) {
+                  if retry.max_output_tokens.take().is_some() {
+                     if let Ok(retry) = serde_json::to_vec(&retry) {
+                        tracing::debug!("upstream rejected max_output_tokens; retrying without it");
+                        return self
+                           .send_once(
+                              access_token,
+                              chatgpt_account_id,
+                              &Bytes::from(retry),
+                              session_id,
+                              model,
+                              headers,
+                           )
+                           .await;
+                     }
+                  }
+               }
+            }
+            if body == UNDECRYPTABLE {
+               if let Some(retry) = drop_undecryptable_payloads(req) {
+                  return self
+                     .send_once(
+                        access_token,
+                        chatgpt_account_id,
+                        &retry,
+                        session_id,
+                        model,
+                        headers,
+                     )
+                     .await;
+               }
+            }
+            Err(SendError::BadRequest(body))
          },
          // Cloudflare occasionally 403s fresh headless clients; the cookie
          // jar picks up clearance on the first response, so retry once.

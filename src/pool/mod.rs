@@ -66,6 +66,9 @@ pub struct Route<'route> {
    pub user: &'route str,
    pub pinned_account: Option<i64>,
    pub prefer_trusted: bool,
+   /// Optional Codex quota caps. Ignored by other backends.
+   pub five_hour_limit: Option<f64>,
+   pub weekly_limit: Option<f64>,
 }
 
 impl<'route> Route<'route> {
@@ -300,6 +303,14 @@ impl<B: Backend> Pool<B> {
       let mut scored = Vec::new();
       for slot in slots {
          if pinned.is_some_and(|id| slot.id != id) || !slot.serves(route.user) {
+            continue;
+         }
+         if B::PROVIDER == Provider::OpenAi
+            && !self
+               .slots
+               .within_quota_limits(&slot, route.five_hour_limit, route.weekly_limit)
+               .await
+         {
             continue;
          }
          if B::PROVIDER == Provider::OpenAi
@@ -556,6 +567,8 @@ mod retry_tests {
          user: "u",
          pinned_account: None,
          prefer_trusted: false,
+      five_hour_limit: None,
+      weekly_limit: None,
       }
    }
 

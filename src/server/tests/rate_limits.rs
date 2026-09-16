@@ -81,6 +81,8 @@ async fn retry_after_on_request_limit_for_both_dialects() {
          window_seconds: 3600,
          slowdown_ms: 0,
          prefer_trusted: false,
+      five_hour_limit: None,
+      weekly_limit: None,
          pinned_account: None,
       },
    )
@@ -172,6 +174,8 @@ async fn retry_after_on_token_limit() {
          window_seconds: 3600,
          slowdown_ms: 0,
          prefer_trusted: false,
+      five_hour_limit: None,
+      weekly_limit: None,
          pinned_account: None,
       },
    )
@@ -305,6 +309,8 @@ async fn rate_limit_headers_present_on_success() {
          window_seconds: 3600,
          slowdown_ms: 0,
          prefer_trusted: false,
+      five_hour_limit: None,
+      weekly_limit: None,
          pinned_account: None,
       },
    )

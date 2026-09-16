@@ -331,6 +331,8 @@ impl Pool<CodexClient> {
             user,
             pinned_account,
             prefer_trusted: true,
+      five_hour_limit: None,
+      weekly_limit: None,
          })
          .await;
       let mut usable = Vec::with_capacity(ranked.len());

@@ -87,6 +87,8 @@ pub struct TokenMeter {
    pub requests: i64,
    pub requests_remaining: Option<i64>,
    pub token_limit: Option<i64>,
+   pub five_hour_limit: Option<f64>,
+   pub weekly_limit: Option<f64>,
    pub tokens: i64,
    pub tokens_remaining: Option<i64>,
    pub slowdown_ms: i64,
@@ -223,7 +225,8 @@ impl Db {
          .call(move |conn| {
             let token = conn
          .query_row(
-            "SELECT id, user, token_prefix, request_limit, token_limit, window_seconds, slowdown_ms
+            "SELECT id, user, token_prefix, request_limit, token_limit,
+                    five_hour_limit, weekly_limit, window_seconds, slowdown_ms
                  FROM api_tokens WHERE id = ?1 OR token_prefix = ?2 ORDER BY id LIMIT 1",
             params![id, key],
             |row| {
@@ -233,8 +236,10 @@ impl Db {
                   row.get::<_, String>(2)?,
                   row.get::<_, Option<i64>>(3)?,
                   row.get::<_, Option<i64>>(4)?,
-                  row.get::<_, i64>(5)?,
-                  row.get::<_, i64>(6)?,
+                  row.get::<_, Option<f64>>(5)?,
+                  row.get::<_, Option<f64>>(6)?,
+                  row.get::<_, i64>(7)?,
+                  row.get::<_, i64>(8)?,
                ))
             },
          )
@@ -245,6 +250,8 @@ impl Db {
                prefix,
                request_limit,
                token_limit,
+               five_hour_limit,
+               weekly_limit,
                window_seconds,
                slowdown_ms,
             )) = token
@@ -267,6 +274,8 @@ impl Db {
                requests,
                requests_remaining: request_limit.map(|limit| (limit - requests).max(0)),
                token_limit,
+               five_hour_limit,
+               weekly_limit,
                tokens,
                tokens_remaining: token_limit.map(|limit| (limit - tokens).max(0)),
                slowdown_ms,
