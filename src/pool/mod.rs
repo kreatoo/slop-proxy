@@ -30,6 +30,8 @@ pub use slots::{Slots, rendezvous_score};
 pub enum PoolError {
    #[error("no usable {0} accounts; run `slop-proxy login`")]
    NoAccounts(Provider),
+   #[error("estimated user quota budget exceeded; retry after {retry_after} seconds")]
+   UserQuotaExceeded { retry_after: i64 },
    #[error("all upstream accounts are cooling down")]
    AllCoolingDown { retry_after: i64 },
    #[error("the {provider} backend rejected {model}: {body}")]
@@ -342,6 +344,32 @@ impl<B: Backend> Pool<B> {
          .collect()
    }
 
+   /// Admission uses settled estimates, not a reservation. Polling delays and
+   /// in-flight completions can overshoot a budget. Spark has a separate meter.
+   async fn user_quota_retry_after(
+      &self,
+      route: Route<'_>,
+      account_id: i64,
+   ) -> Result<Option<i64>, PoolError> {
+      if B::PROVIDER != Provider::OpenAi || route.model.eq_ignore_ascii_case("gpt-5.3-codex-spark")
+      {
+         return Ok(None);
+      }
+      let quota = self
+         .slots
+         .db()
+         .user_quota_retry_after(route.user, account_id)
+         .await
+         .map_err(|err| PoolError::Upstream(format!("checking estimated user quota budget: {err}")))?;
+      let spend = self
+         .slots
+         .db()
+         .user_spend_retry_after(route.user, account_id)
+         .await
+         .map_err(|err| PoolError::Upstream(format!("checking estimated USD budget: {err}")))?;
+      Ok(quota.or(spend))
+   }
+
    async fn served(&self, slot: &Slot, resp: B::Response) -> B::Response {
       if !self.backend.is_handshake(&resp) {
          self.slots.mark_ok(slot).await;
@@ -418,14 +446,33 @@ impl<B: Backend> Pool<B> {
          }
          return Err(PoolError::NoAccounts(B::PROVIDER));
       }
-      self.wait_out_own_cooldown(route, ranked.first()).await;
+      // Filter before waiting or refreshing credentials. A spent user/account
+      // pair must not prevent routing to another eligible account.
+      let mut eligible = Vec::new();
+      let mut quota_retry: Option<i64> = None;
+      for slot in ranked {
+         if self.slots.is_disabled(&slot).await {
+            continue;
+         }
+         if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
+            quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
+         } else {
+            eligible.push(slot);
+         }
+      }
+      self.wait_out_own_cooldown(route, eligible.first()).await;
       let mut last_err = Option::<SendError>::None;
       let mut attempts = 0;
-      for slot in ranked {
+      for slot in eligible {
          if attempts >= B::ATTEMPTS {
             break;
          }
          if !self.slots.try_claim(&slot).await {
+            continue;
+         }
+         // Recheck after a possible cooldown wait and before upstream I/O.
+         if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
+            quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
             continue;
          }
          attempts += 1;
@@ -445,6 +492,10 @@ impl<B: Backend> Pool<B> {
                AuthPolicy::RefreshOnce => {
                   tracing::warn!("account {} got 401, forcing refresh", slot.display);
                   if let Ok(fresh) = self.slots.fresh_token(&slot, true).await {
+                     if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
+                        quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
+                        continue;
+                     }
                      match self.backend.send(&fresh, &slot, route, req).await {
                         Ok(resp) => {
                            self.bind_session(route.session_key, slot.id).await;
@@ -486,6 +537,9 @@ impl<B: Backend> Pool<B> {
                last_err = Some(err);
             },
          }
+      }
+      if let Some(retry_after) = quota_retry {
+         return Err(PoolError::UserQuotaExceeded { retry_after });
       }
       match last_err {
          Some(SendError::BadRequest(body)) => Err(PoolError::BadRequest {
@@ -567,8 +621,8 @@ mod retry_tests {
          user: "u",
          pinned_account: None,
          prefer_trusted: false,
-      five_hour_limit: None,
-      weekly_limit: None,
+         five_hour_limit: None,
+         weekly_limit: None,
       }
    }
 
@@ -695,5 +749,202 @@ mod reason_tests {
             ),
             "max_tokens is too large"
         );
+   }
+}
+
+#[cfg(test)]
+mod user_quota_tests {
+   use super::*;
+   use crate::db::accounts::NewAccount;
+   use crate::db::quota::QuotaObservation;
+   use crate::oauth::TokenSet;
+   use crate::provider::AuthMode;
+   use std::env;
+   use std::sync::atomic::{AtomicUsize, Ordering};
+   use uuid::Uuid;
+
+   struct Counting(AtomicUsize);
+
+   impl Backend for Counting {
+      const PROVIDER: Provider = Provider::OpenAi;
+      const RATE_LIMIT: Cooldown = Cooldown { max: 1, base: 1 };
+      const ON_AUTH: AuthPolicy = AuthPolicy::RefreshOnce;
+      type Request = ();
+      type Response = ();
+
+      async fn send(&self, _: &str, _: &Slot, _: Route<'_>, &(): &()) -> Result<(), SendError> {
+         self.0.fetch_add(1, Ordering::SeqCst);
+         Ok(())
+      }
+   }
+
+   fn route() -> Route<'static> {
+      Route {
+         session_key: "session",
+         model: "gpt-5-codex",
+         user: "alice",
+         service_tier: None,
+         pinned_account: None,
+         prefer_trusted: false,
+         five_hour_limit: None,
+         weekly_limit: None,
+      }
+   }
+
+   async fn pool() -> (Db, Pool<Counting>) {
+      let db =
+         Db::open(&env::temp_dir().join(format!("slop-user-quota-{}.db", Uuid::new_v4()))).unwrap();
+      for name in ["one", "two"] {
+         db.upsert_account(NewAccount {
+            provider: Provider::OpenAi,
+            id: name,
+            email: None,
+            label: None,
+            plan: None,
+            tokens: &TokenSet {
+               access_token: "at".into(),
+               refresh_token: "rt".into(),
+               id_token: None,
+               expires_at: Some(clock::unix_now() + 3600),
+            },
+            auth_mode: AuthMode::OAuth,
+         })
+         .await
+         .unwrap();
+      }
+      let pool = Pool::load(db.clone(), Counting(AtomicUsize::new(0)))
+         .await
+         .unwrap();
+      (db, pool)
+   }
+
+   async fn block(db: &Db, account_id: i64) {
+      let now = clock::unix_now();
+      db.observe_quota(QuotaObservation {
+         account_id,
+         window_seconds: 18_000,
+         resets_at: now + 3600,
+         used_percent: 30.0_f64,
+         observed_at: now,
+      })
+      .await
+      .unwrap();
+      db.set_user_quota_budget("alice", account_id, 18_000, Some(0.0_f64))
+         .await
+         .unwrap();
+   }
+
+   #[tokio::test]
+   async fn spent_user_accounts_are_rejected_before_upstream_and_other_users_are_unaffected() {
+      let (db, pool) = pool().await;
+      for slot in pool.slots.list().await {
+         block(&db, slot.id).await;
+      }
+      assert!(matches!(pool.execute(route(), ()).await,
+         Err(PoolError::UserQuotaExceeded { retry_after }) if retry_after > 0));
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 0);
+      pool
+         .execute(
+            Route {
+               user: "bob",
+               ..route()
+            },
+            (),
+         )
+         .await
+         .unwrap();
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
+      // Model listings keep the same candidates; they spend no quota.
+      assert_eq!(
+         pool
+            .ranked(Route {
+               model: "",
+               ..route()
+            })
+            .await
+            .len(),
+         2
+      );
+   }
+
+   #[tokio::test]
+   async fn user_budget_falls_back_but_pinned_accounts_do_not_escape() {
+      let (db, pool) = pool().await;
+      let ranked = pool.ranked(route()).await;
+      block(&db, ranked[0].id).await;
+      let (account, ()) = pool.execute(route(), ()).await.unwrap();
+      assert_eq!(account, Some(ranked[1].id));
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
+      assert!(matches!(
+         pool
+            .execute(
+               Route {
+                  pinned_account: Some(ranked[0].id),
+                  ..route()
+               },
+               ()
+            )
+            .await,
+         Err(PoolError::UserQuotaExceeded { .. })
+      ));
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
+   }
+
+   #[tokio::test]
+   async fn usd_budget_falls_back_and_blocks_pinned_accounts() {
+      let (db, pool) = pool().await;
+      let ranked = pool.ranked(route()).await;
+      db.set_user_spend_budget("alice", ranked[0].id, Some(0.0_f64))
+         .await
+         .unwrap();
+      let (account, ()) = pool.execute(route(), ()).await.unwrap();
+      assert_eq!(account, Some(ranked[1].id));
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
+      let blocked = pool
+         .execute(
+            Route {
+               pinned_account: Some(ranked[0].id),
+               ..route()
+            },
+            (),
+         )
+         .await;
+      assert!(matches!(blocked, Err(PoolError::UserQuotaExceeded { retry_after }) if retry_after >= 60));
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
+   }
+
+   #[tokio::test]
+   async fn separately_metered_spark_does_not_spend_main_user_budget() {
+      let (db, pool) = pool().await;
+      for slot in pool.slots.list().await {
+         block(&db, slot.id).await;
+      }
+      pool
+         .execute(
+            Route {
+               model: "gpt-5.3-codex-spark",
+               ..route()
+            },
+            (),
+         )
+         .await
+         .unwrap();
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
+   }
+
+   #[tokio::test]
+   async fn quota_database_errors_fail_closed_before_upstream() {
+      let (db, pool) = pool().await;
+      db.call(|conn| {
+         conn.execute_batch("DROP TABLE user_quota_budgets")?;
+         Ok(())
+      })
+      .await
+      .unwrap();
+      assert!(matches!(
+         pool.execute(route(), ()).await,
+         Err(PoolError::Upstream(_))
+      ));
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 0);
    }
 }

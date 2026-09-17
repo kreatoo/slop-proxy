@@ -70,6 +70,22 @@ pub fn pool_error_response(dialect: Dialect, models: &ModelsConfig, err: PoolErr
          "api_error",
          &format!("no usable {provider} accounts; an admin must run `slop-proxy login`"),
       ),
+      PoolError::UserQuotaExceeded { retry_after } => {
+         let err_type = match dialect {
+            Dialect::Anthropic => "rate_limit_error",
+            Dialect::OpenAi => "rate_limit_exceeded",
+         };
+         let mut resp = error_response(
+            dialect,
+            429,
+            err_type,
+            "estimated user quota budget or estimated USD budget exceeded for eligible accounts; retry after the budget window resets",
+         );
+         if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
+            resp.headers_mut().insert("retry-after", value);
+         }
+         resp
+      },
       PoolError::AllCoolingDown { retry_after } => {
          let err_type = match dialect {
             Dialect::Anthropic => "rate_limit_error",
@@ -127,7 +143,7 @@ pub fn body_at(body: &[u8], error: &serde_json::Error) -> String {
 pub const fn pool_error_status(err: &PoolError) -> i64 {
    match *err {
       PoolError::NoAccounts(_) => 503,
-      PoolError::AllCoolingDown { .. } => 429,
+      PoolError::AllCoolingDown { .. } | PoolError::UserQuotaExceeded { .. } => 429,
       PoolError::BadRequest { .. } => 400,
       PoolError::Upstream(_) => 502,
    }

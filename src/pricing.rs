@@ -256,12 +256,28 @@ impl Prices {
    /// Loads the cached copy first so pricing is available before the network
    /// is, then refreshes from upstream.
    pub async fn load(&self) {
-      if self.table().is_empty()
-         && let Ok(body) = fs::read_to_string(&self.cache_path).await
-         && let Ok(table) = PriceTable::parse(&body)
+      // Older deployments kept the cache at the volume root while the
+      // database moved under an application-data directory. Try that legacy
+      // location so a valid cached table is not lost during the migration.
+      let legacy_cache = self
+         .cache_path
+         .parent()
+         .and_then(Path::parent)
+         .and_then(Path::parent)
+         .map(|parent| parent.join("litellm-prices.json"));
+      for cache_path in [Some(self.cache_path.clone()), legacy_cache]
+         .into_iter()
+         .flatten()
       {
-         tracing::info!("loaded {} cached model prices", table.len());
-         *self.table.write().unwrap() = Arc::new(table);
+         if !self.table().is_empty() {
+            break;
+         }
+         if let Ok(body) = fs::read_to_string(cache_path).await
+            && let Ok(table) = PriceTable::parse(&body)
+         {
+            tracing::info!("loaded {} cached model prices", table.len());
+            *self.table.write().unwrap() = Arc::new(table);
+         }
       }
       if let Err(err) = self.refresh().await {
          tracing::warn!("refreshing model prices: {err}");

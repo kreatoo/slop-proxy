@@ -19,7 +19,7 @@ use super::{DIALECT, PassthroughRequest, prepare_request, restore_reserved_names
 use crate::codex::types::{ResponsesEvent, ResponsesRequest};
 use crate::codex::websocket::{Fault, MAX_MESSAGE_SIZE, Socket, response_error as upstream_error};
 use crate::db::usage::AdmissionError;
-use crate::pool::Route;
+use crate::pool::{PoolError, Route};
 use crate::provider::Provider;
 use crate::server::auth::{AuthInfo, bearer_token};
 use crate::server::error::{error_response, out_of_scope, pool_error_response, translation_error};
@@ -220,20 +220,26 @@ impl Relay {
          five_hour_limit: auth.limits.five_hour_limit,
          weekly_limit: auth.limits.weekly_limit,
       };
-      let serves = self
+      let can_reconnect = self.pending.is_empty()
+         && req
+            .rest
+            .get("previous_response_id")
+            .is_none_or(Value::is_null);
+      let serves = match self
          .state
          .pools
          .codex
          .websocket_serves(self.account_id, route)
          .await
-         .map_err(|error| pool_error_response(DIALECT, &self.state.cfg.models, error))?;
+      {
+         Ok(serves) => serves,
+         // A complete history can move to an unspent account. Continuations
+         // and in-flight responses must keep their socket, so reject instead.
+         Err(PoolError::UserQuotaExceeded { .. }) if can_reconnect => false,
+         Err(error) => return Err(pool_error_response(DIALECT, &self.state.cfg.models, error)),
+      };
       if !serves {
-         if !self.pending.is_empty()
-            || req
-               .rest
-               .get("previous_response_id")
-               .is_some_and(|previous| !previous.is_null())
-         {
+         if !can_reconnect {
             return Err(translation_error(
                DIALECT,
                "changing service tier requires a new connection with the complete input history",

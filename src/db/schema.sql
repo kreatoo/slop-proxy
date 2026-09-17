@@ -83,3 +83,54 @@ CREATE TABLE IF NOT EXISTS usage_log (
 CREATE INDEX IF NOT EXISTS idx_usage_ts         ON usage_log(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_user_ts    ON usage_log(user, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_account_ts ON usage_log(account_id, ts);
+
+-- Provider snapshots are an audit trail, including valid but stale readings.
+CREATE TABLE IF NOT EXISTS quota_observations (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  window_seconds INTEGER NOT NULL CHECK (window_seconds IN (18000, 604800)),
+  resets_at INTEGER NOT NULL,
+  used_percent REAL NOT NULL CHECK (used_percent BETWEEN 0 AND 100),
+  observed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quota_observations_epoch
+  ON quota_observations(account_id, window_seconds, resets_at, observed_at);
+
+-- Reset epochs and estimates survive restarts until explicit account removal.
+CREATE TABLE IF NOT EXISTS quota_epochs (
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  window_seconds INTEGER NOT NULL,
+  resets_at INTEGER NOT NULL,
+  observed_percent REAL NOT NULL,
+  high_water_percent REAL NOT NULL,
+  baseline_percent REAL NOT NULL,
+  unattributed_percent REAL NOT NULL,
+  observed_at INTEGER NOT NULL,
+  usage_cursor INTEGER NOT NULL,
+  PRIMARY KEY (account_id, window_seconds, resets_at)
+);
+CREATE TABLE IF NOT EXISTS user_quota_estimates (
+  user TEXT NOT NULL,
+  account_id INTEGER NOT NULL,
+  window_seconds INTEGER NOT NULL,
+  resets_at INTEGER NOT NULL,
+  used_percent REAL NOT NULL,
+  PRIMARY KEY (user, account_id, window_seconds, resets_at),
+  FOREIGN KEY (account_id, window_seconds, resets_at)
+    REFERENCES quota_epochs(account_id, window_seconds, resets_at) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS user_quota_budgets (
+  user TEXT NOT NULL CHECK (length(trim(user)) > 0),
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  window_seconds INTEGER NOT NULL CHECK (window_seconds IN (18000, 604800)),
+  budget_percent REAL NOT NULL CHECK (budget_percent BETWEEN 0 AND 100),
+  PRIMARY KEY (user, account_id, window_seconds)
+);
+
+-- Lifetime spend budgets have no automatic reset.
+CREATE TABLE IF NOT EXISTS user_spend_budgets (
+  user       TEXT NOT NULL CHECK (length(trim(user)) > 0),
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  budget_usd REAL NOT NULL CHECK (budget_usd >= 0),
+  PRIMARY KEY (user, account_id)
+);

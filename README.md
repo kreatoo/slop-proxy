@@ -132,3 +132,99 @@ unlimited. If Codex does not report a configured window, that check is skipped.
 ```sh
 slop-proxy token create --user alice --5hr-limit 50% --weekly-limit 50%
 ```
+
+These `--5hr-limit` and `--weekly-limit` flags remain **account-wide utilization
+ceilings**, not personal allowances. For example, `--5hr-limit 50%` stops that
+token from using an account once the account's reported five-hour utilization
+reaches 50%, regardless of who consumed it. Their semantics are unchanged.
+
+## Estimated per-user subscription quota
+
+Quota accounting estimates each user's consumption of a Codex account's main
+five-hour and weekly subscription allowances. It groups usage by the token's
+`--user` value, across **all tokens for that user**. Issuing another token for
+`kader` does not create a separate allowance. Separately metered Spark quota is
+not included. Other providers are not supported by this accounting yet.
+
+Reports and budgets are per account and per subscription window. They do not
+add percentages across accounts: 25% of one plan need not buy the same amount
+of work as 25% of another plan. These are provider subscription windows, not
+the rolling `--window-seconds` windows used for request and token limits.
+
+```sh
+# JSON report across accounts, or for one account
+slop-proxy quota usage --user kader
+slop-proxy quota usage --user kader --account personal
+
+# Each account selector can be an ID, email, or label
+slop-proxy quota budget --user kader --account personal \
+  --5hr-budget 25% --weekly-budget 25% --usd-budget 400
+
+# Replace all budgets: retain a five-hour budget and clear weekly/USD budgets
+slop-proxy quota budget --user kader --account personal --5hr-budget 25%
+
+# Clear both budgets for this user on this account
+slop-proxy quota budget --user kader --account personal
+```
+
+Window budget values must include `%` and be between `0%` and `100%`. The
+`--usd-budget` value is a nonnegative dollar amount, such as `400` or `$400`.
+Each `quota budget` command replaces **all three** budgets for the selected
+user and account. An omitted budget is cleared (unlimited). No user budgets
+exist by default; `kader` stays unlimited unless you explicitly set one.
+Existing token limits and provider limits still apply.
+
+A `25%` budget allows estimated consumption of 25% of the account's full
+allowance, stored as **25 percentage points**. A reported estimate of 10 means
+10% of the full allowance, or 10 percentage points of utilization. Against a
+25% budget, that is 40% of the user's budget, not 10% of that budget. Quota
+percentages are not exact token counts or provider billing figures.
+
+The USD budget is an estimate based on public model list prices. It is not
+subscription billing, an invoice, or a charge to the user. Unlike the
+provider's rolling windows, it lasts for the lifetime of the user/account
+policy and must be cleared manually with `--usd-budget` omitted. USD usage is
+only reliable when the proxy has a current model-pricing cache; refresh or
+restore that cache before relying on this limit. Requests are counted after
+they settle, so delayed settlement and in-flight requests can delay
+enforcement and can cause overshoot.
+
+JSON reports distinguish the provider's account-wide `observed_used_percent`
+from the proxy's per-user `estimated_user_percent` (percentage points of the
+full subscription window). `budget_percent` is the assigned share, while
+`allowance_used_percent` is the estimated percentage of that share consumed.
+The latter is undefined (`null`) without a current reading or with a zero
+budget. `baseline_percent` and `unattributed_percent` describe usage that was
+not assigned to a user. `estimated_cost_usd` is lifetime settled list-price
+value for the user and account. When configured, `spend_budget_usd` is the
+lifetime USD ceiling and `spend_allowance_used_percent` is its estimated
+share consumed. All reports are marked `estimated: true`.
+
+The proxy polls provider usage about once a minute. It distributes observed
+increases among newly settled, non-Spark Codex requests. When all requests in
+an interval have model pricing, relative estimated dollar cost supplies the
+weights. Otherwise the entire interval uses weighted input, output, and cache
+token counts. This accounts for different models and cache usage better than
+raw token counts, but does not reproduce the provider's private quota formula.
+A provider reading covers the whole account; a user estimate covers work
+attributed to that user by this proxy, subject to the limits below.
+
+### Estimation limits
+
+- An empty report means there are no current readings or configured budgets
+  for the selected user/accounts. It does not prove exactly zero consumption.
+  A budget-only row can have `estimated_user_percent: 0` with null observation
+  fields. That is zero in the known ledger, not a measured zero. A window that
+  has expired also needs a new reading before its utilization is known.
+- Accounting starts with observations made by this proxy. If the account is
+  already at 44% when first observed, that 44% is an unattributed baseline. It
+  cannot be assigned retroactively to `kader` or any other user.
+- The first sample, including the first sample after a new reset, establishes
+  an unattributed baseline. Only later observed increases can be attributed.
+- Provider samples can be delayed or rounded. Attribution is an estimate,
+  not a provider-exact measurement of each user's subscription usage.
+- Usage outside the proxy cannot be reliably distinguished from proxy usage
+  when they overlap. Such usage can affect the estimated shares.
+- Budget checks act on observed estimates. Requests already in flight can
+  complete after a budget is reached, so delayed samples, rounding, and
+  concurrent requests can cause overshoot. These are not hard prepaid caps.

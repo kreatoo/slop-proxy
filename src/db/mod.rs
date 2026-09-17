@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod quota;
 pub mod tokens;
 pub mod usage;
 
@@ -128,7 +129,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
 /// Indexes over columns `ADDED_COLUMNS` introduces, so they are built after
 /// the ALTERs rather than failing on a database that predates them.
 const LATE_INDEXES: &str =
-   "CREATE INDEX IF NOT EXISTS idx_usage_session_ts ON usage_log(session_key, ts);";
+   "CREATE INDEX IF NOT EXISTS idx_usage_session_ts ON usage_log(session_key, ts);
+    CREATE INDEX IF NOT EXISTS idx_usage_quota_cursor ON usage_log(account_id, provider, id);";
 
 fn add_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
    let present = conn

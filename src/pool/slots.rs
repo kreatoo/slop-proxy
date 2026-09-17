@@ -183,6 +183,10 @@ pub struct Slots {
 }
 
 impl Slots {
+   pub(crate) const fn db(&self) -> &Db {
+      &self.db
+   }
+
    pub async fn load(db: Db, provider: Provider) -> eyre::Result<Self> {
       let slots = Self {
          provider,
@@ -970,8 +974,16 @@ mod quota_tests {
    fn each_codex_window_is_checked_only_when_configured() {
       let usage = AccountUsage {
          windows: vec![
-            UsageWindow { name: "5h".into(), utilization: 0.5, resets_at: None },
-            UsageWindow { name: "7d".into(), utilization: 0.2, resets_at: None },
+            UsageWindow {
+               name: "5h".into(),
+               utilization: 0.5,
+               resets_at: None,
+            },
+            UsageWindow {
+               name: "7d".into(),
+               utilization: 0.2,
+               resets_at: None,
+            },
          ],
          ..AccountUsage::default()
       };

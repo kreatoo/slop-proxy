@@ -560,3 +560,96 @@ async fn websocket_handshake_rate_limits_are_returned_before_upgrade() {
    assert_eq!(response.status(), 429);
    assert!(response.headers().contains_key("retry-after"));
 }
+
+#[tokio::test]
+async fn websocket_estimated_user_quota_rechecks_existing_socket_and_handshake() {
+   let (base, db, mut requests, _) = mock().await;
+   let account = db.list_accounts().await.unwrap().remove(0).id;
+   db.set_user_quota_budget("alice", account, 18_000, Some(10.0_f64))
+      .await
+      .unwrap();
+   let (mut socket, _) = connect_async(upgrade_request(&base)).await.unwrap();
+   let turn = json!({"type":"response.create", "model":"gpt-6-astra", "input":[]});
+   send(&mut socket, turn.clone()).await;
+   assert_eq!(event(&mut socket).await["type"], "response.completed");
+   requests.recv().await.unwrap();
+   // A budget update must affect an already authenticated socket immediately.
+   db.set_user_quota_budget("alice", account, 18_000, Some(0.0_f64))
+      .await
+      .unwrap();
+   for continuation in [false, true] {
+      let mut request = turn.clone();
+      if continuation {
+         request["previous_response_id"] = json!("r");
+      }
+      send(&mut socket, request).await;
+      let error = event(&mut socket).await;
+      assert_eq!(error["status"], 429_i32);
+      assert!(error["headers"]["retry-after"].is_string());
+      assert!(
+         error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("estimated user quota budget")
+      );
+      requests.try_recv().unwrap_err();
+   }
+   let Err(Error::Http(rejected)) = connect_async(upgrade_request(&base)).await else {
+      panic!("expected budget-rejected handshake")
+   };
+   assert_eq!(rejected.status(), 429);
+   assert!(rejected.headers().contains_key("retry-after"));
+   // Separately metered Spark is allowed even on the same socket.
+   send(
+      &mut socket,
+      json!({"type":"response.create", "model":"gpt-5.3-codex-spark", "input":[]}),
+   )
+   .await;
+   assert_eq!(event(&mut socket).await["type"], "response.completed");
+   assert_eq!(
+      requests.recv().await.unwrap()["model"],
+      "gpt-5.3-codex-spark"
+   );
+   socket.close(None).await.unwrap();
+}
+
+
+#[tokio::test]
+async fn websocket_estimated_usd_budget_rechecks_existing_socket_and_handshake() {
+   let (base, db, mut requests, _) = mock().await;
+   let account = db.list_accounts().await.unwrap().remove(0).id;
+   let (mut socket, _) = connect_async(upgrade_request(&base)).await.unwrap();
+   let turn = json!({"type":"response.create", "model":"gpt-6-astra", "input":[]});
+   send(&mut socket, turn.clone()).await;
+   assert_eq!(event(&mut socket).await["type"], "response.completed");
+   requests.recv().await.unwrap();
+   db.set_user_spend_budget("alice", account, Some(0.0_f64))
+      .await
+      .unwrap();
+   for continuation in [false, true] {
+      let mut request = turn.clone();
+      if continuation {
+         request["previous_response_id"] = json!("r");
+      }
+      send(&mut socket, request).await;
+      let error = event(&mut socket).await;
+      assert_eq!(error["status"], 429_i32);
+      assert!(error["headers"]["retry-after"].as_str().unwrap().parse::<i64>().unwrap() >= 60);
+      assert!(error["error"]["message"].as_str().unwrap().contains("estimated USD budget"));
+      requests.try_recv().unwrap_err();
+   }
+   let Err(Error::Http(rejected)) = connect_async(upgrade_request(&base)).await else {
+      panic!("expected budget-rejected handshake")
+   };
+   assert_eq!(rejected.status(), 429);
+   assert!(rejected.headers().contains_key("retry-after"));
+   // Spark has its own meter and remains eligible.
+   send(
+      &mut socket,
+      json!({"type":"response.create", "model":"gpt-5.3-codex-spark", "input":[]}),
+   )
+   .await;
+   assert_eq!(event(&mut socket).await["type"], "response.completed");
+   assert_eq!(requests.recv().await.unwrap()["model"], "gpt-5.3-codex-spark");
+   socket.close(None).await.unwrap();
+}

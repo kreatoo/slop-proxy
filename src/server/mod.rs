@@ -88,7 +88,9 @@ pub async fn serve(db: Db, cfg: Config, bind: &str) -> Result<()> {
    let reload_state = state.clone();
    tokio::spawn(async move {
       let mut tick = time::interval(Duration::from_secs(60));
-      tick.tick().await;
+      // The first tick is immediate: establish quota baselines after startup
+      // rather than leaving the first minute of traffic outside accounting.
+      tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
       loop {
          tick.tick().await;
          reload_state.pools.reload().await;

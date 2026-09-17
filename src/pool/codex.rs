@@ -11,10 +11,11 @@ use super::{
    window_seconds,
 };
 use crate::clock::unix_now;
-use crate::codex::client::CodexClient;
+use crate::codex::client::{CodexClient, RateLimit};
 use crate::codex::models::{ModelInfo, ModelsResponse, ServiceTier};
 use crate::codex::types::ErrorEnvelope;
 use crate::codex::websocket::Connection;
+use crate::db::quota::QuotaObservation;
 use crate::provider::Provider;
 use crate::upstream::SendError;
 
@@ -250,6 +251,33 @@ impl Pool<CodexClient> {
       self.backend()
    }
 
+   /// Only successful main-meter polling feeds attribution. Header and socket
+   /// readings remain capacity hints, never durable user charges.
+   async fn observe_user_quota(&self, slot: &Slot, limits: &RateLimit, observed_at: i64) {
+      for window in limits.windows() {
+         if !matches!(window.limit_window_seconds, 18_000 | 604_800)
+            || !window.used_percent.is_finite()
+            || !(0.0_f64..=100.0_f64).contains(&window.used_percent)
+         {
+            continue;
+         }
+         let Some(resets_at) = window.reset_at.filter(|reset| *reset > observed_at) else {
+            continue;
+         };
+         let observation = QuotaObservation {
+            account_id: slot.id,
+            window_seconds: window.limit_window_seconds,
+            resets_at,
+            used_percent: window.used_percent,
+            observed_at,
+         };
+         if let Err(err) = self.slots.db().observe_quota(observation).await {
+            tracing::error!(account = %slot.display, error = %err,
+               "persisting estimated user quota observation failed");
+         }
+      }
+   }
+
    /// Reads quota for every account from the usage endpoint, so idle
    /// accounts report current figures instead of whatever they last saw on
    /// a served response.
@@ -264,8 +292,16 @@ impl Pool<CodexClient> {
          let Ok(token) = self.slots.fresh_token(&slot, false).await else {
             continue;
          };
+         // Snapshot before the request, not after network latency. Attribution
+         // still lags delayed readings and settled completions (second-level
+         // timestamps are not reservations). Never persist header or WS samples:
+         // those can arrive out of order and before stream usage is settled.
+         let observed_at = unix_now();
          match self.backend.usage(&token, &slot.provider_account_id).await {
             Ok(usage) => {
+               self
+                  .observe_user_quota(&slot, &usage.rate_limit, observed_at)
+                  .await;
                let windows = usage
                   .rate_limit
                   .windows()
@@ -331,8 +367,8 @@ impl Pool<CodexClient> {
             user,
             pinned_account,
             prefer_trusted: true,
-      five_hour_limit: None,
-      weekly_limit: None,
+            five_hour_limit: None,
+            weekly_limit: None,
          })
          .await;
       let mut usable = Vec::with_capacity(ranked.len());
@@ -447,6 +483,13 @@ impl Pool<CodexClient> {
       account_id: Option<i64>,
       route: Route<'_>,
    ) -> Result<bool, PoolError> {
+      // Called for every response.create, including requests on an existing
+      // socket without a service tier. Handshake admission alone is not enough.
+      if let Some(id) = account_id
+         && let Some(retry_after) = self.user_quota_retry_after(route, id).await?
+      {
+         return Err(PoolError::UserQuotaExceeded { retry_after });
+      }
       let Some(tier) = route.explicit_tier() else {
          return Ok(true);
       };
@@ -513,5 +556,128 @@ fn window_name(minutes: i64) -> String {
       format!("{}h", minutes / 60)
    } else {
       format!("{minutes}m")
+   }
+}
+
+#[cfg(test)]
+mod quota_poll_tests {
+   use super::*;
+   use crate::config::CodexConfig;
+   use crate::db::{Db, accounts::NewAccount, usage::UsageRecord};
+   use crate::oauth::TokenSet;
+   use crate::provider::AuthMode;
+   use axum::{Json, Router, routing::get};
+   use std::env;
+   use std::sync::Mutex;
+   use tokio::net::TcpListener;
+   use uuid::Uuid;
+
+   #[tokio::test]
+   async fn quota_poll_persists_only_valid_main_windows_and_settled_deltas() {
+      let reset = unix_now() + 3600;
+      let payload = Arc::new(Mutex::new(json!({
+         "rate_limit": {"primary_window": {
+            "used_percent": 25.0_f64, "limit_window_seconds": 18_000, "reset_at": reset
+         }, "secondary_window": {
+            "used_percent": 50.0_f64, "limit_window_seconds": 3600, "reset_at": reset
+         }},
+         "additional_rate_limits": [{"limit_name":"spark", "rate_limit": {
+            "primary_window": {"used_percent": 90.0_f64, "limit_window_seconds": 604_800, "reset_at": reset}
+         }}]
+      })));
+      let incoming = Arc::clone(&payload);
+      let app = Router::new()
+         .route("/models", get(|| async { Json(json!({"models":[]})) }))
+         .route(
+            "/usage",
+            get(move || {
+               let value = incoming.lock().unwrap().clone();
+               async move { Json(value) }
+            }),
+         );
+      let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let base_url = format!("http://{}", listener.local_addr().unwrap());
+      let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+      let db =
+         Db::open(&env::temp_dir().join(format!("slop-quota-poll-{}.db", Uuid::new_v4()))).unwrap();
+      db.upsert_account(NewAccount {
+         provider: Provider::OpenAi,
+         id: "poll",
+         email: None,
+         label: None,
+         plan: None,
+         tokens: &TokenSet {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            id_token: None,
+            expires_at: Some(unix_now() + 3600),
+         },
+         auth_mode: AuthMode::OAuth,
+      })
+      .await
+      .unwrap();
+      let pool = CodexPool::load(
+         db.clone(),
+         CodexClient::new(CodexConfig {
+            base_url,
+            ..CodexConfig::default()
+         }),
+      )
+      .await
+      .unwrap();
+      pool.poll_usage().await;
+      let baseline = db.user_quota("alice", None).await.unwrap();
+      assert_eq!(
+         baseline.len(),
+         1,
+         "unknown and separately metered windows are excluded"
+      );
+      assert_eq!(baseline[0].window_seconds, 18_000);
+      assert_eq!(baseline[0].baseline_percent, Some(25.0_f64));
+      assert_eq!(baseline[0].estimated_user_percent, 0.0_f64);
+      let account = baseline[0].account_id;
+      // Move only the test timestamp back so two polls in the same second are
+      // distinct snapshots, without a wall-clock sleep in the test.
+      db.call(|conn| {
+         conn.execute("UPDATE quota_epochs SET observed_at = observed_at - 2", [])?;
+         Ok(())
+      })
+      .await
+      .unwrap();
+      db.enqueue_usage(UsageRecord {
+         user: "alice".into(),
+         account_id: Some(account),
+         provider: Some(Provider::OpenAi),
+         upstream_model: "gpt-5-codex".into(),
+         input_tokens: 100,
+         output_tokens: 25,
+         ..UsageRecord::default()
+      })
+      .unwrap();
+      db.flush().await.unwrap();
+      payload.lock().unwrap()["rate_limit"]["primary_window"]["used_percent"] = json!(35.0_f64);
+      payload.lock().unwrap()["rate_limit"]["secondary_window"] = json!({
+         "used_percent":50.0_f64, "limit_window_seconds":604_800, "reset_at":0
+      });
+      pool.poll_usage().await;
+      let report = db.user_quota("alice", None).await.unwrap();
+      assert_eq!(
+         report.len(),
+         1,
+         "a known window with an invalid reset is excluded"
+      );
+      assert!((report[0].estimated_user_percent - 10.0_f64).abs() < f64::EPSILON);
+      // WS samples update pool capacity but never enter the durable ledger.
+      let mut event = json!({"rate_limits":{"primary": {
+         "used_percent":99.0_f64, "window_minutes":300, "reset_at":reset
+      }}});
+      pool
+         .rewrite_rate_limits(Some(account), "alice", None, &mut event)
+         .await;
+      assert_eq!(
+         db.user_quota("alice", None).await.unwrap()[0].observed_used_percent,
+         Some(35.0_f64)
+      );
+      server.abort();
    }
 }

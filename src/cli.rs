@@ -62,6 +62,11 @@ pub enum Command {
       #[pound(subcommand)]
       command: TokenCommand,
    },
+   /// Report and limit estimated per-user Codex subscription usage
+   Quota {
+      #[pound(subcommand)]
+      command: QuotaCommand,
+   },
    /// Run the API server
    Serve {
       /// Listen address
@@ -186,6 +191,35 @@ pub enum TokenCommand {
 }
 
 #[derive(Parse)]
+pub enum QuotaCommand {
+   /// Show estimated usage per account and subscription window as JSON
+   Usage {
+      #[pound(long)]
+      user: String,
+      /// Limit the report to this account, by id, email or label
+      #[pound(long)]
+      account: Option<String>,
+   },
+   /// Replace both user budgets for an account; omitted budgets are unlimited
+   Budget {
+      #[pound(long)]
+      user: String,
+      /// Account id, email or label
+      #[pound(long)]
+      account: String,
+      /// User's estimated share of the five-hour allowance, such as 25%
+      #[pound(long = "5hr-budget")]
+      five_hour_budget: Option<String>,
+      /// User's estimated share of the weekly allowance, such as 25%
+      #[pound(long)]
+      weekly_budget: Option<String>,
+      /// User's estimated spend budget in US dollars
+      #[pound(long)]
+      usd_budget: Option<String>,
+   },
+}
+
+#[derive(Parse)]
 pub enum DebugCommand {
    /// Send a raw request upstream and dump the SSE events
    Ping {
@@ -288,6 +322,10 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             token_set_limits(&db, &token, &limits).await
          },
          TokenCommand::Usage { token } => token_usage(&db, &token).await,
+      },
+      Command::Quota { command } => {
+         println!("{}", quota_command(&db, command).await?);
+         Ok(())
       },
       Command::Serve { bind } => {
          let bind = bind.unwrap_or_else(|| cfg.bind.clone());
@@ -509,6 +547,66 @@ fn parse_percentage(raw: Option<String>, flag: &str) -> Result<Option<f64>> {
    Ok(Some(value / 100.0))
 }
 
+async fn quota_command(db: &Db, command: QuotaCommand) -> Result<String> {
+   match command {
+      QuotaCommand::Usage { user, account } => {
+         let account_id = resolve_pin(db, account).await?;
+         let usage = db.user_quota(&user, account_id).await?;
+         Ok(serde_json::to_string_pretty(&usage)?)
+      },
+      QuotaCommand::Budget {
+         user,
+         account,
+         five_hour_budget,
+         weekly_budget,
+         usd_budget,
+      } => {
+         // Validate every value before changing any budget.
+         let (five_hour_budget, weekly_budget) = quota_budgets(five_hour_budget, weekly_budget)?;
+         let usd_budget = parse_usd_budget(usd_budget, "--usd-budget")?;
+         let account_id = resolve_pin(db, Some(account))
+            .await?
+            .ok_or_else(|| eyre!("--account is required"))?;
+         // The quota replacement is atomic for its two windows. The spend
+         // budget has its own atomic update; validation above prevents a bad
+         // value from leaving either policy half changed.
+         db.set_user_quota_budgets(&user, account_id, five_hour_budget, weekly_budget)
+            .await?;
+         db.set_user_spend_budget(&user, account_id, usd_budget).await?;
+         Ok(format!(
+            "updated quota budgets for {user} on account {account_id}"
+         ))
+      },
+   }
+}
+
+fn parse_usd_budget(raw: Option<String>, flag: &str) -> Result<Option<f64>> {
+   let Some(raw) = raw else {
+      return Ok(None);
+   };
+   let value = raw
+      .strip_prefix('$')
+      .unwrap_or(&raw)
+      .parse::<f64>()
+      .map_err(|_| eyre!("{flag} must be a nonnegative dollar amount such as 400"))?;
+   if !value.is_finite() || value < 0.0_f64 {
+      bail!("{flag} must be a finite, nonnegative dollar amount");
+   }
+   Ok(Some(value))
+}
+
+fn quota_budgets(
+   five_hour_budget: Option<String>,
+   weekly_budget: Option<String>,
+) -> Result<(Option<f64>, Option<f64>)> {
+   // Token ceilings use fractions, but user quota accounting uses percentage points.
+   let five_hour =
+      parse_percentage(five_hour_budget, "--5hr-budget")?.map(|fraction| fraction * 100.0_f64);
+   let weekly =
+      parse_percentage(weekly_budget, "--weekly-budget")?.map(|fraction| fraction * 100.0_f64);
+   Ok((five_hour, weekly))
+}
+
 async fn token_set_limits(db: &Db, token: &str, limits: &TokenLimits) -> Result<()> {
    if db.set_token_limits(token, limits).await? == 0 {
       bail!("no token matched {token:?}");
@@ -625,11 +723,350 @@ async fn debug_refresh(db: &Db, account: &str) -> Result<()> {
    Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
-   use super::{Cli, Command, TokenCommand, parse_percentage};
+   use super::{
+      Cli, Command, QuotaCommand, TokenCommand, parse_percentage, parse_usd_budget, quota_budgets,
+   };
+   use super::{Db, NewAccount, TokenLimits, quota_command};
+   use std::env;
+
+   use crate::oauth::TokenSet;
+   use crate::provider::{AuthMode, Provider};
    use pound::Parse as _;
+
+   async fn quota_test_database() -> (Db, i64) {
+      let path = env::temp_dir().join(format!("slop-cli-{}.db", uuid::Uuid::new_v4()));
+      let db = Db::open(&path).unwrap();
+      let account = db
+         .upsert_account(NewAccount {
+            provider: Provider::OpenAi,
+            id: "quota-cli-account",
+            email: Some("quota@example.com"),
+            label: Some("personal"),
+            plan: None,
+            tokens: &TokenSet {
+               access_token: "unused".into(),
+               refresh_token: "unused".into(),
+               id_token: None,
+               expires_at: None,
+            },
+            auth_mode: AuthMode::OAuth,
+         })
+         .await
+         .unwrap();
+      (db, account)
+   }
+
+   async fn dispatch_quota(db: &Db, args: &[&str]) -> eyre::Result<String> {
+      let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
+      let Command::Quota { command } = cli.command else {
+         panic!("expected quota command");
+      };
+      quota_command(db, command).await
+   }
+
+   #[tokio::test]
+   async fn quota_dispatch_replaces_budgets_without_changing_token_limits() {
+      let (db, account) = quota_test_database().await;
+      let token = db.create_token("kader", "cli-secret", "cli").await.unwrap();
+      db.set_token_limits(
+         &token.to_string(),
+         &TokenLimits {
+            requests: Some(60),
+            tokens: Some(100_000),
+            window_seconds: 3600,
+            slowdown_ms: 250,
+            five_hour_limit: Some(0.5_f64),
+            weekly_limit: Some(0.75_f64),
+            prefer_trusted: true,
+            pinned_account: Some(account),
+            providers: vec![Provider::OpenAi],
+         },
+      )
+      .await
+      .unwrap();
+      dispatch_quota(
+         &db,
+         &[
+            "quota",
+            "budget",
+            "--user",
+            "kader",
+            "--account",
+            "personal",
+            "--5hr-budget",
+            "25%",
+            "--weekly-budget",
+            "12.5%",
+            "--usd-budget",
+            "400",
+         ],
+      )
+      .await
+      .unwrap();
+      let rows = db.user_quota("kader", Some(account)).await.unwrap();
+      assert_eq!(rows.len(), 2);
+      assert_eq!(
+         (rows[0].window_seconds, rows[0].budget_percent),
+         (18000, Some(25.0_f64))
+      );
+      assert_eq!(
+         (rows[1].window_seconds, rows[1].budget_percent),
+         (604_800, Some(12.5_f64))
+      );
+      assert!(rows.iter().all(|row| row.spend_budget_usd == Some(400.0)));
+
+      // An invalid second value must not replace the valid first budget.
+      let _ = dispatch_quota(
+         &db,
+         &[
+            "quota",
+            "budget",
+            "--user",
+            "kader",
+            "--account",
+            "personal",
+            "--5hr-budget",
+            "80%",
+            "--weekly-budget",
+            "101%",
+         ],
+      )
+      .await
+      .unwrap_err();
+      assert_eq!(
+         db.user_quota("kader", Some(account)).await.unwrap()[0].budget_percent,
+         Some(25.0_f64)
+      );
+
+      dispatch_quota(
+         &db,
+         &[
+            "quota",
+            "budget",
+            "--user",
+            "kader",
+            "--account",
+            "quota@example.com",
+            "--5hr-budget",
+            "30%",
+         ],
+      )
+      .await
+      .unwrap();
+      let replaced_rows = db.user_quota("kader", Some(account)).await.unwrap();
+      assert_eq!(replaced_rows.len(), 1);
+      assert_eq!(replaced_rows[0].budget_percent, Some(30.0_f64));
+      dispatch_quota(
+         &db,
+         &[
+            "quota",
+            "budget",
+            "--user",
+            "kader",
+            "--account",
+            &account.to_string(),
+         ],
+      )
+      .await
+      .unwrap();
+      assert!(
+         db.user_quota("kader", Some(account))
+            .await
+            .unwrap()
+            .is_empty()
+      );
+
+      let limits = db.auth_token("cli-secret").await.unwrap().unwrap().limits;
+      assert_eq!(limits.requests, Some(60));
+      assert_eq!(limits.tokens, Some(100_000));
+      assert_eq!(limits.window_seconds, 3600);
+      assert_eq!(limits.slowdown_ms, 250);
+      assert_eq!(limits.five_hour_limit, Some(0.5_f64));
+      assert_eq!(limits.weekly_limit, Some(0.75_f64));
+      assert!(limits.prefer_trusted);
+      assert_eq!(limits.pinned_account, Some(account));
+      assert_eq!(limits.providers, vec![Provider::OpenAi]);
+   }
+
+   #[tokio::test]
+   async fn quota_usage_dispatch_serializes_unknown_observations_as_null() {
+      let (db, account) = quota_test_database().await;
+      let empty = dispatch_quota(&db, &["quota", "usage", "--user", "kader"])
+         .await
+         .unwrap();
+      assert_eq!(
+         serde_json::from_str::<serde_json::Value>(&empty).unwrap(),
+         serde_json::json!([])
+      );
+      db.set_user_quota_budget("kader", account, 18000, Some(25.0_f64))
+         .await
+         .unwrap();
+      let json = dispatch_quota(
+         &db,
+         &["quota", "usage", "--user", "kader", "--account", "personal"],
+      )
+      .await
+      .unwrap();
+      let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+      assert_eq!(rows[0]["account_id"], account);
+      assert_eq!(rows[0]["user"], "kader");
+      assert_eq!(rows[0]["budget_percent"], 25.0_f64);
+      assert_eq!(rows[0]["estimated"], true);
+      assert!(rows[0]["observed_used_percent"].is_null());
+      assert!(rows[0]["resets_at"].is_null());
+      assert!(rows[0]["allowance_used_percent"].is_null());
+      let _ = dispatch_quota(
+         &db,
+         &["quota", "usage", "--user", "kader", "--account", "missing"],
+      )
+      .await
+      .unwrap_err();
+   }
+
+   #[test]
+   fn quota_usage_accepts_optional_account() {
+      for account in [None, Some("1"), Some("kader@example.com"), Some("personal")] {
+         let mut args = vec!["quota", "usage", "--user", "kader"];
+         if let Some(account) = account {
+            args.extend(["--account", account]);
+         }
+         let cli = Cli::try_parse_from(args).unwrap();
+         let Command::Quota {
+            command:
+               QuotaCommand::Usage {
+                  user,
+                  account: parsed,
+               },
+         } = cli.command
+         else {
+            panic!("expected quota usage");
+         };
+         assert_eq!(user, "kader");
+         assert_eq!(parsed.as_deref(), account);
+      }
+   }
+
+   #[test]
+   fn quota_budget_accepts_percentage_flags() {
+      let cli = Cli::try_parse_from([
+         "quota",
+         "budget",
+         "--user",
+         "kader",
+         "--account",
+         "personal",
+         "--5hr-budget",
+         "25%",
+         "--weekly-budget",
+         "12.5%",
+      ])
+      .unwrap();
+      let Command::Quota {
+         command:
+            QuotaCommand::Budget {
+               user,
+               account,
+               five_hour_budget,
+               weekly_budget,
+               usd_budget,
+            },
+      } = cli.command
+      else {
+         panic!("expected quota budget");
+      };
+      assert_eq!(user, "kader");
+      assert_eq!(account, "personal");
+      assert_eq!(usd_budget, None);
+      assert_eq!(
+         quota_budgets(five_hour_budget, weekly_budget).unwrap(),
+         (Some(25.0_f64), Some(12.5_f64))
+      );
+   }
+
+   #[test]
+   fn quota_budget_omitted_windows_are_unlimited() {
+      let cli =
+         Cli::try_parse_from(["quota", "budget", "--user", "kader", "--account", "1"]).unwrap();
+      let Command::Quota {
+         command:
+            QuotaCommand::Budget {
+               five_hour_budget,
+               weekly_budget,
+               usd_budget,
+               ..
+            },
+      } = cli.command
+      else {
+         panic!("expected quota budget");
+      };
+      assert_eq!(usd_budget, None);
+      assert_eq!(
+         quota_budgets(five_hour_budget, weekly_budget).unwrap(),
+         (None, None)
+      );
+      assert_eq!(
+         quota_budgets(Some("25%".into()), None).unwrap(),
+         (Some(25.0_f64), None)
+      );
+      assert_eq!(
+         quota_budgets(None, Some("25%".into())).unwrap(),
+         (None, Some(25.0_f64))
+      );
+   }
+
+   #[test]
+   fn quota_budget_accepts_finite_nonnegative_usd_amounts() {
+      for (raw, expected) in [("0", 0.0), ("400", 400.0), ("12.50", 12.5), ("$400", 400.0)] {
+         assert_eq!(parse_usd_budget(Some(raw.into()), "--usd-budget").unwrap(), Some(expected));
+      }
+      assert_eq!(parse_usd_budget(None, "--usd-budget").unwrap(), None);
+      for raw in ["-1", "NaN", "inf", "$", "$-1", "garbage"] {
+         assert!(parse_usd_budget(Some(raw.into()), "--usd-budget").is_err());
+      }
+   }
+
+   #[test]
+   fn quota_budget_requires_usd_amount_when_flag_is_present() {
+      let cli = Cli::try_parse_from([
+         "quota",
+         "budget",
+         "--user",
+         "kader",
+         "--account",
+         "personal",
+         "--usd-budget",
+         "$400",
+      ])
+      .unwrap();
+      let Command::Quota {
+         command: QuotaCommand::Budget { usd_budget, .. },
+      } = cli.command
+      else {
+         panic!("expected quota budget");
+      };
+      assert_eq!(parse_usd_budget(usd_budget, "--usd-budget").unwrap(), Some(400.0));
+   }
+
+   #[test]
+   fn quota_commands_require_user_and_budget_requires_account() {
+      assert!(Cli::try_parse_from(["quota", "usage"]).is_err());
+      assert!(Cli::try_parse_from(["quota", "budget", "--account", "1"]).is_err());
+      assert!(Cli::try_parse_from(["quota", "budget", "--user", "kader"]).is_err());
+   }
+
+   #[test]
+   fn quota_budgets_accept_only_bounded_finite_percentages() {
+      assert_eq!(
+         quota_budgets(Some("0%".into()), Some("100%".into())).unwrap(),
+         (Some(0.0_f64), Some(100.0_f64))
+      );
+      for value in ["25", "101%", "-1%", "NaN%", "inf%", "garbage%"] {
+         let _ = quota_budgets(Some(value.into()), None).unwrap_err();
+         let _ = quota_budgets(None, Some(value.into())).unwrap_err();
+      }
+   }
 
    #[test]
    fn token_create_accepts_codex_percentage_flags() {
@@ -645,11 +1082,12 @@ mod tests {
       ])
       .unwrap();
       let Command::Token {
-         command: TokenCommand::Create {
-            five_hour_limit,
-            weekly_limit,
-            ..
-         },
+         command:
+            TokenCommand::Create {
+               five_hour_limit,
+               weekly_limit,
+               ..
+            },
       } = cli.command
       else {
          panic!("expected token create");
