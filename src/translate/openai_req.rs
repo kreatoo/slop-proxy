@@ -10,6 +10,7 @@ use crate::config::Config;
 pub fn to_responses(req: &ChatRequest, cfg: &Config) -> Result<ResponsesRequest, TranslateError> {
    let resolved = model_map::resolve(&cfg.models, &req.model);
    let mut out = ResponsesRequest::new(resolved.model.clone(), cfg.codex.instructions());
+   out.service_tier = resolved.service_tier.clone();
 
    for msg in &req.messages {
       convert_message(msg, &mut out.input)?;

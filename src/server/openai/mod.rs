@@ -815,6 +815,9 @@ fn prepare_request(
       return Err(Box::new(super::error::out_of_scope(DIALECT, provider)));
    }
    req.model = Some(resolved.model.clone());
+   if req.service_tier.is_none() {
+      req.service_tier = resolved.service_tier.clone();
+   }
    if req
       .reasoning
       .as_ref()

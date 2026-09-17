@@ -4,6 +4,7 @@ use crate::config::{ModelsConfig, pattern_specificity};
 pub struct ResolvedModel {
    pub model: String,
    pub effort: Option<String>,
+   pub service_tier: Option<String>,
 }
 
 const EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -18,10 +19,12 @@ fn split_suffix(requested: &str) -> (&str, Option<String>) {
 /// The requested model is passed through to the backend as-is.
 pub fn resolve(cfg: &ModelsConfig, requested: &str) -> ResolvedModel {
    let (name, suffix_effort) = split_suffix(requested);
+   let fast = name.strip_suffix("-fast").filter(|base| !base.is_empty());
+   let lookup_name = fast.unwrap_or(name);
 
    let mut best = None;
    for (pattern, alias) in &cfg.aliases {
-      let Some(specificity) = pattern_specificity(pattern, name) else {
+      let Some(specificity) = pattern_specificity(pattern, lookup_name) else {
          continue;
       };
       if best.is_none_or(|(spec, _)| specificity > spec) {
@@ -32,12 +35,14 @@ pub fn resolve(cfg: &ModelsConfig, requested: &str) -> ResolvedModel {
       return ResolvedModel {
          model: alias.model.clone(),
          effort: suffix_effort.or_else(|| alias.effort.clone()),
+         service_tier: fast.map(|_| "priority".to_owned()),
       };
    }
 
    ResolvedModel {
-      model: name.to_owned(),
+      model: lookup_name.to_owned(),
       effort: suffix_effort.or_else(|| cfg.default_effort.clone()),
+      service_tier: fast.map(|_| "priority".to_owned()),
    }
 }
 
@@ -60,10 +65,14 @@ mod tests {
       let cfg = ModelsConfig::default();
       let res = resolve(&cfg, "gpt-5.6-terra");
       assert_eq!(res.model, "gpt-5.6-terra");
+      assert_eq!(res.service_tier, None);
 
       let r_suffix = resolve(&cfg, "gpt-5.6-sol:high");
       assert_eq!(r_suffix.model, "gpt-5.6-sol");
       assert_eq!(r_suffix.effort.as_deref(), Some("high"));
+      let fast = resolve(&cfg, "gpt-5.6-luna-fast");
+      assert_eq!(fast.model, "gpt-5.6-luna");
+      assert_eq!(fast.service_tier.as_deref(), Some("priority"));
    }
 
    #[test]
