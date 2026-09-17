@@ -22,6 +22,9 @@ pub struct ModelInfo {
    pub input_modalities: Vec<String>,
    #[serde(default)]
    pub service_tiers: Vec<ServiceTier>,
+   /// Provider-declared model speed variants, such as `fast`.
+   #[serde(default)]
+   pub additional_speed_tiers: Vec<String>,
    #[serde(flatten)]
    pub rest: BTreeMap<String, Value>,
 }
@@ -71,6 +74,33 @@ impl ModelsResponse {
             || fast_base_slug(requested).is_some_and(|base| model.slug == base))
             && model.service_tiers.iter().any(|service| service.id == tier)
       })
+   }
+
+   /// Materialize provider-declared speed variants as discoverable model slugs.
+   pub fn expand_speed_variants(&mut self) {
+      let existing: std::collections::BTreeSet<String> =
+         self.models.iter().map(|model| model.slug.clone()).collect();
+      let mut variants = Vec::new();
+      for model in &self.models {
+         for speed in &model.additional_speed_tiers {
+            let speed = speed.trim();
+            if speed.is_empty() {
+               continue;
+            }
+            let slug = format!("{}-{speed}", model.slug);
+            if existing.contains(&slug)
+               || variants.iter().any(|entry: &ModelInfo| entry.slug == slug)
+            {
+               continue;
+            }
+            let mut variant = model.clone();
+            variant.slug = slug;
+            variant.display_name = variant.display_name.map(|name| format!("{name} ({speed})"));
+            variant.additional_speed_tiers.clear();
+            variants.push(variant);
+         }
+      }
+      self.models.extend(variants);
    }
 
    pub fn add_service_tier(&mut self, slug: &str, tier: ServiceTier) {
@@ -258,6 +288,35 @@ mod zen_entry_tests {
          .map(|level| level["effort"].as_str().unwrap())
          .collect();
       assert_eq!(efforts, ["low", "xhigh"]);
+   }
+
+   #[test]
+   fn provider_speed_tiers_are_materialized_as_models() {
+      let mut catalog: ModelsResponse = serde_json::from_str(
+         r#"{"models":[{"slug":"gpt-6-astra","display_name":"GPT-6-Astra","additional_speed_tiers":["fast","priority"]}]}"#,
+      )
+      .unwrap();
+      catalog.expand_speed_variants();
+      assert!(
+         catalog
+            .models
+            .iter()
+            .any(|model| model.slug == "gpt-6-astra-fast")
+      );
+      assert!(
+         catalog
+            .models
+            .iter()
+            .any(|model| model.slug == "gpt-6-astra-priority")
+      );
+      assert_eq!(
+         catalog
+            .models
+            .iter()
+            .find(|model| model.slug == "gpt-6-astra-fast")
+            .and_then(|model| model.display_name.as_deref()),
+         Some("GPT-6-Astra (fast)")
+      );
    }
 
    #[test]

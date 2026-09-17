@@ -409,6 +409,7 @@ impl Pool<CodexClient> {
       for entry in entries {
          combined.merge(&entry);
       }
+      combined.expand_speed_variants();
       combined.add_service_tier(
          "gpt-5.6-sol",
          ServiceTier {
