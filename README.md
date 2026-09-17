@@ -14,6 +14,9 @@ the Codex backend. Log in to Max accounts with
 Endpoints: `POST /v1/messages`, `POST /v1/chat/completions`, `GET /v1/models`,
 `POST /v1/responses` — streaming, tools, images, and reasoning. Requested model
 names pass through to the backend as-is; use `slop-proxy models` for the real slugs.
+OpenAI latency variants using the generic `-fast` suffix are also accepted when
+an account catalog advertises their base model, such as `gpt-6-astra-fast` when
+`gpt-6-astra` is available.
 
 ## NixOS module
 

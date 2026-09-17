@@ -309,7 +309,7 @@ impl Slots {
       let Some(catalog) = state.catalog.as_ref() else {
          return true;
       };
-      catalog.models.is_empty() || catalog.models.iter().any(|entry| entry.slug == model)
+      catalog.supports_model(model)
    }
 
    pub async fn serves_tier(&self, slot: &Slot, model: &str, tier: &str) -> bool {
@@ -317,11 +317,10 @@ impl Slots {
          return true;
       }
       let state = slot.state.lock().await;
-      state.catalog.as_ref().is_some_and(|catalog| {
-         catalog.models.iter().any(|entry| {
-            entry.slug == model && entry.service_tiers.iter().any(|service| service.id == tier)
-         })
-      })
+      state
+         .catalog
+         .as_ref()
+         .is_some_and(|catalog| catalog.supports_tier(model, tier))
    }
 
    pub async fn mark_ok(&self, slot: &Slot) {

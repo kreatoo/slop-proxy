@@ -51,9 +51,34 @@ pub struct ModelsResponse {
 }
 
 impl ModelsResponse {
+   /// Returns the catalog slug that can authorize a requested model.
+   ///
+   /// OpenAI occasionally exposes latency variants as a `-fast` suffix while
+   /// the account catalog only advertises the underlying model. Keep the
+   /// requested slug untouched for the upstream call, but let admission use
+   /// the base capability when (and only when) that base is listed.
+   pub fn supports_model(&self, requested: &str) -> bool {
+      self.models.is_empty()
+         || self.models.iter().any(|model| {
+            model.slug == requested
+               || fast_base_slug(requested).is_some_and(|base| model.slug == base)
+         })
+   }
+
+   pub fn supports_tier(&self, requested: &str, tier: &str) -> bool {
+      self.models.iter().any(|model| {
+         (model.slug == requested
+            || fast_base_slug(requested).is_some_and(|base| model.slug == base))
+            && model.service_tiers.iter().any(|service| service.id == tier)
+      })
+   }
+
    pub fn add_service_tier(&mut self, slug: &str, tier: ServiceTier) {
       if let Some(model) = self.models.iter_mut().find(|model| model.slug == slug)
-         && !model.service_tiers.iter().any(|existing| existing.id == tier.id)
+         && !model
+            .service_tiers
+            .iter()
+            .any(|existing| existing.id == tier.id)
       {
          model.service_tiers.push(tier);
       }
@@ -80,6 +105,15 @@ impl ModelsResponse {
          }
       }
    }
+}
+
+/// The provider's generic fast-model convention. We deliberately only accept
+/// the complete `-fast` suffix, rather than guessing from arbitrary name
+/// fragments or making up models for discovery.
+pub fn fast_base_slug(requested: &str) -> Option<&str> {
+   requested
+      .strip_suffix("-fast")
+      .filter(|base| !base.is_empty())
 }
 
 impl ModelInfo {
@@ -186,7 +220,9 @@ pub fn with_zen_entries(raw: &str, template: &str, ids: &[String]) -> Option<Str
 
 #[cfg(test)]
 mod zen_entry_tests {
-   use super::with_zen_entries;
+   use std::collections::BTreeMap;
+
+   use super::{ModelsResponse, with_zen_entries};
 
    const CATALOG: &str = r#"{"models":[
       {"slug":"gpt-5.6-sol","visibility":"list","tool_mode":"code_mode_only","apply_patch_tool_type":"freeform",
@@ -222,6 +258,39 @@ mod zen_entry_tests {
          .map(|level| level["effort"].as_str().unwrap())
          .collect();
       assert_eq!(efforts, ["low", "xhigh"]);
+   }
+
+   #[test]
+   fn fast_variants_use_a_listed_base_for_capability_checks() {
+      let catalog: ModelsResponse =
+         serde_json::from_str(r#"{"models":[{"slug":"gpt-6-astra"}]}"#).unwrap();
+      assert!(catalog.supports_model("gpt-6-astra"));
+      assert!(catalog.supports_model("gpt-6-astra-fast"));
+      assert!(!catalog.supports_model("gpt-6-astra-fast-preview"));
+      assert!(!catalog.supports_model("gpt-7-astra-fast"));
+   }
+
+   #[test]
+   fn fast_variants_inherit_tiers_from_their_listed_base() {
+      let catalog: ModelsResponse = serde_json::from_str(
+         r#"{"models":[{"slug":"gpt-6-astra","service_tiers":[{"id":"priority","name":"Priority","description":""}]}]}"#,
+      )
+      .unwrap();
+      assert!(catalog.supports_tier("gpt-6-astra-fast", "priority"));
+      assert!(!catalog.supports_tier("gpt-6-astra-fast", "standard"));
+   }
+
+   #[test]
+   fn fast_variants_are_not_invented_for_empty_or_unrelated_catalogs() {
+      let empty = ModelsResponse {
+         models: Vec::new(),
+         rest: BTreeMap::new(),
+      };
+      assert!(empty.supports_model("gpt-6-astra-fast"));
+      let catalog: ModelsResponse =
+         serde_json::from_str(r#"{"models":[{"slug":"gpt-6-astra-fast"}]}"#).unwrap();
+      assert!(catalog.supports_model("gpt-6-astra-fast"));
+      assert!(!catalog.supports_model("gpt-6-astra"));
    }
 
    #[test]
