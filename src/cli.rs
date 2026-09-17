@@ -200,6 +200,8 @@ pub enum QuotaCommand {
       #[pound(long)]
       account: Option<String>,
    },
+   /// Show provider-reported quota usage for all accounts as a table
+   Accounts,
    /// Replace both user budgets for an account; omitted budgets are unlimited
    Budget {
       #[pound(long)]
@@ -324,7 +326,7 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
          TokenCommand::Usage { token } => token_usage(&db, &token).await,
       },
       Command::Quota { command } => {
-         println!("{}", quota_command(&db, command).await?);
+         println!("{}", quota_command(&db, &cfg, command).await?);
          Ok(())
       },
       Command::Serve { bind } => {
@@ -547,8 +549,9 @@ fn parse_percentage(raw: Option<String>, flag: &str) -> Result<Option<f64>> {
    Ok(Some(value / 100.0))
 }
 
-async fn quota_command(db: &Db, command: QuotaCommand) -> Result<String> {
+async fn quota_command(db: &Db, cfg: &Config, command: QuotaCommand) -> Result<String> {
    match command {
+      QuotaCommand::Accounts => quota_accounts(db, cfg).await,
       QuotaCommand::Usage { user, account } => {
          let account_id = resolve_pin(db, account).await?;
          let usage = db.user_quota(&user, account_id).await?;
@@ -572,12 +575,69 @@ async fn quota_command(db: &Db, command: QuotaCommand) -> Result<String> {
          // value from leaving either policy half changed.
          db.set_user_quota_budgets(&user, account_id, five_hour_budget, weekly_budget)
             .await?;
-         db.set_user_spend_budget(&user, account_id, usd_budget).await?;
+         db.set_user_spend_budget(&user, account_id, usd_budget)
+            .await?;
          Ok(format!(
             "updated quota budgets for {user} on account {account_id}"
          ))
       },
    }
+}
+
+async fn quota_accounts(db: &Db, cfg: &Config) -> Result<String> {
+   let client = CodexClient::new(cfg.codex.clone());
+   let accounts = db
+      .list_accounts()
+      .await?
+      .into_iter()
+      .filter(|account| account.provider == Provider::OpenAi)
+      .collect::<Vec<_>>();
+   let mut out =
+      String::from("ID  ACCOUNT                              PLAN  5H       WEEK     STATUS\n");
+   out.push_str(
+      "--  ----------------------------------  ----  -------  -------  ----------------\n",
+   );
+   for account in accounts {
+      let display = account
+         .email
+         .as_deref()
+         .or(account.label.as_deref())
+         .unwrap_or(&account.provider_account_id);
+      let (five_hour, weekly, status) = match client
+         .usage(&account.access_token, &account.provider_account_id)
+         .await
+      {
+         Ok(usage) => {
+            let mut five_hour = "-".to_owned();
+            let mut weekly = "-".to_owned();
+            for window in usage.rate_limit.windows() {
+               let value = format!("{:.0}%", window.used_percent);
+               match window.limit_window_seconds {
+                  18_000 => five_hour = value,
+                  604_800 => weekly = value,
+                  _ => {},
+               }
+            }
+            let status = if usage.rate_limit.limit_reached {
+               "LIMIT REACHED"
+            } else {
+               "available"
+            };
+            (five_hour, weekly, status.to_owned())
+         },
+         Err(error) => ("-".into(), "-".into(), format!("error: {error}")),
+      };
+      out.push_str(&format!(
+         "{:<3} {:<36}  {:<4}  {:<7}  {:<7}  {}\n",
+         account.id,
+         display.chars().take(36).collect::<String>(),
+         account.plan_type.as_deref().unwrap_or("-"),
+         five_hour,
+         weekly,
+         status,
+      ));
+   }
+   Ok(out.trim_end().to_owned())
 }
 
 fn parse_usd_budget(raw: Option<String>, flag: &str) -> Result<Option<f64>> {
@@ -731,6 +791,7 @@ mod tests {
    use super::{Db, NewAccount, TokenLimits, quota_command};
    use std::env;
 
+   use crate::config::Config;
    use crate::oauth::TokenSet;
    use crate::provider::{AuthMode, Provider};
    use pound::Parse as _;
@@ -760,10 +821,11 @@ mod tests {
 
    async fn dispatch_quota(db: &Db, args: &[&str]) -> eyre::Result<String> {
       let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
+      let cfg = Config::load(&cli).unwrap();
       let Command::Quota { command } = cli.command else {
          panic!("expected quota command");
       };
-      quota_command(db, command).await
+      quota_command(db, &cfg, command).await
    }
 
    #[tokio::test]
@@ -1019,7 +1081,10 @@ mod tests {
    #[test]
    fn quota_budget_accepts_finite_nonnegative_usd_amounts() {
       for (raw, expected) in [("0", 0.0), ("400", 400.0), ("12.50", 12.5), ("$400", 400.0)] {
-         assert_eq!(parse_usd_budget(Some(raw.into()), "--usd-budget").unwrap(), Some(expected));
+         assert_eq!(
+            parse_usd_budget(Some(raw.into()), "--usd-budget").unwrap(),
+            Some(expected)
+         );
       }
       assert_eq!(parse_usd_budget(None, "--usd-budget").unwrap(), None);
       for raw in ["-1", "NaN", "inf", "$", "$-1", "garbage"] {
@@ -1046,7 +1111,10 @@ mod tests {
       else {
          panic!("expected quota budget");
       };
-      assert_eq!(parse_usd_budget(usd_budget, "--usd-budget").unwrap(), Some(400.0));
+      assert_eq!(
+         parse_usd_budget(usd_budget, "--usd-budget").unwrap(),
+         Some(400.0)
+      );
    }
 
    #[test]
