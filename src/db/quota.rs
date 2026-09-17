@@ -420,7 +420,8 @@ fn fleet_reports(conn: &Connection, user: &str, now: i64) -> Result<Vec<UserQuot
    let mut stmt = conn.prepare(
       "WITH current AS (
       SELECT e.* FROM quota_epochs e WHERE e.resets_at > ?2 AND e.account_id IN
-         (SELECT id FROM accounts WHERE provider = 'openai')
+         (SELECT id FROM accounts WHERE provider = 'openai'
+            AND (allowed_users = '' OR length(allowed_users) - length(replace(allowed_users, ',', '')) >= 1))
          AND NOT EXISTS (SELECT 1 FROM quota_epochs newer WHERE newer.account_id = e.account_id
             AND newer.window_seconds = e.window_seconds AND newer.resets_at > e.resets_at)
    ), windows AS (
@@ -838,6 +839,34 @@ mod tests {
             .unwrap()
             .is_some()
       );
+   }
+
+   #[tokio::test]
+   async fn fleet_budget_excludes_personal_accounts() {
+      let (db, _) = database();
+      let shared = account(&db, "openai").await;
+      let personal = account(&db, "openai").await;
+      db.set_account_allowed_users(&personal.to_string(), "alice")
+         .await
+         .unwrap();
+      let now = clock::unix_now();
+      sample(&db, shared, now + 18000, now, 80.0).await;
+      sample(&db, personal, now + 18000, now, 10.0).await;
+      work(&db, personal, "alice", 1.0, 100, 0).await;
+      db.set_user_fleet_quota_budgets("alice", Some(50.0), None)
+         .await
+         .unwrap();
+      let fleet = db
+         .user_quota("alice", None)
+         .await
+         .unwrap()
+         .into_iter()
+         .find(|row| row.account_id.is_none())
+         .expect("fleet report");
+      close(fleet.fleet_capacity_points.unwrap(), 20.0);
+      close(fleet.fleet_estimated_user_percent.unwrap(), 0.0);
+      assert!(db.is_shared_account(shared).await.unwrap());
+      assert!(!db.is_shared_account(personal).await.unwrap());
    }
 
    #[tokio::test]

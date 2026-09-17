@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use eyre::Result;
-use rusqlite::{Row, params, types::FromSqlError};
+use rusqlite::{OptionalExtension as _, Row, params, types::FromSqlError};
 
 use super::Db;
 use crate::oauth::TokenSet;
@@ -175,6 +175,26 @@ impl Db {
             let id = key.parse::<i64>().unwrap_or(-1);
             let mut rows = stmt.query_map(params![id, key], from_row)?;
             Ok(rows.next().transpose()?)
+         })
+         .await
+   }
+
+   /// Whether an account participates in fleet-wide OpenAI quota policy.
+   /// Empty allowlists are shared; a one-user allowlist is personal.
+   pub async fn is_shared_account(&self, account_id: i64) -> Result<bool> {
+      self
+         .call(move |conn| {
+            let Some((provider, allowed_users)) = conn
+               .query_row(
+                  "SELECT provider, allowed_users FROM accounts WHERE id = ?1",
+                  [account_id],
+                  |row| Ok((row.get::<_, Provider>(0)?, row.get::<_, String>(1)?)),
+               )
+               .optional()?
+            else {
+               return Ok(false);
+            };
+            Ok(provider == Provider::OpenAi && parse_users(&allowed_users).len() != 1)
          })
          .await
    }

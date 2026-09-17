@@ -358,6 +358,19 @@ impl<B: Backend> Pool<B> {
       {
          return Ok(None);
       }
+      if let Some(account_id) = route.pinned_account
+         && !self
+            .slots
+            .db()
+            .is_shared_account(account_id)
+            .await
+            .map_err(|err| {
+               tracing::error!(error = %err, account_id, "checking account sharing policy failed");
+               PoolError::UserQuotaExceeded { retry_after: 60 }
+            })?
+      {
+         return Ok(None);
+      }
       self
          .slots
          .db()
