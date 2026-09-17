@@ -344,6 +344,31 @@ impl<B: Backend> Pool<B> {
          .collect()
    }
 
+   /// Check the fleet-wide estimate before choosing an account. This is kept
+   /// separate from the per-account check because a fleet budget must not be
+   /// bypassed by moving the request to another account.
+   ///
+   /// A failure to read the fleet budget fails closed: admission is refused
+   /// rather than allowing traffic through while the guard is unavailable.
+   pub(crate) async fn fleet_quota_retry_after(
+      &self,
+      route: Route<'_>,
+   ) -> Result<Option<i64>, PoolError> {
+      if B::PROVIDER != Provider::OpenAi || route.model.eq_ignore_ascii_case("gpt-5.3-codex-spark")
+      {
+         return Ok(None);
+      }
+      self
+         .slots
+         .db()
+         .user_fleet_quota_retry_after(route.user)
+         .await
+         .map_err(|err| {
+            tracing::error!(error = %err, user = route.user, "checking fleet quota budget failed");
+            PoolError::UserQuotaExceeded { retry_after: 60 }
+         })
+   }
+
    /// Admission uses settled estimates, not a reservation. Polling delays and
    /// in-flight completions can overshoot a budget. Spark has a separate meter.
    async fn user_quota_retry_after(
@@ -360,7 +385,9 @@ impl<B: Backend> Pool<B> {
          .db()
          .user_quota_retry_after(route.user, account_id)
          .await
-         .map_err(|err| PoolError::Upstream(format!("checking estimated user quota budget: {err}")))?;
+         .map_err(|err| {
+            PoolError::Upstream(format!("checking estimated user quota budget: {err}"))
+         })?;
       let spend = self
          .slots
          .db()
@@ -388,6 +415,11 @@ impl<B: Backend> Pool<B> {
       route: Route<'_>,
       req: B::Request,
    ) -> Result<(Option<i64>, B::Response), PoolError> {
+      // Check once per request, before routing chooses an account. The
+      // account-scoped checks in each sweep remain necessary for fallback.
+      if let Some(retry_after) = self.fleet_quota_retry_after(route).await? {
+         return Err(PoolError::UserQuotaExceeded { retry_after });
+      }
       let budget = self.backend.retry_budget();
       let deadline = Instant::now() + budget;
       loop {
@@ -909,7 +941,9 @@ mod user_quota_tests {
             (),
          )
          .await;
-      assert!(matches!(blocked, Err(PoolError::UserQuotaExceeded { retry_after }) if retry_after >= 60));
+      assert!(
+         matches!(blocked, Err(PoolError::UserQuotaExceeded { retry_after }) if retry_after >= 60)
+      );
       assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
    }
 

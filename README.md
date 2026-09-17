@@ -146,33 +146,54 @@ five-hour and weekly subscription allowances. It groups usage by the token's
 `kader` does not create a separate allowance. Separately metered Spark quota is
 not included. Other providers are not supported by this accounting yet.
 
-Reports and budgets are per account and per subscription window. They do not
-add percentages across accounts: 25% of one plan need not buy the same amount
-of work as 25% of another plan. These are provider subscription windows, not
-the rolling `--window-seconds` windows used for request and token limits.
+Reports and budgets can be per account or fleet-wide, and always refer to a
+provider subscription window rather than the rolling `--window-seconds` windows
+used for request and token limits. With `--account`, a percentage is a share of
+that account's allowance. Without `--account`, percentage budgets apply to the
+user's fleet: they are a share of the remaining known capacity across all
+accounts at the current provider-epoch snapshots. For example, if two accounts
+are each at 80%, the fleet has 40 percentage points remaining, so a 50% fleet
+budget allows 20 points. If two users each have a 50% fleet budget, each gets 20
+points from that 40-point fleet capacity—not 10 points. If the example instead
+uses a 20-point per-account budget, each user gets 10 points per account.
 
 ```sh
 # JSON report across accounts, or for one account
 slop-proxy quota usage --user kader
 slop-proxy quota usage --user kader --account personal
 
-# Each account selector can be an ID, email, or label
+# Each account selector can be an ID, email, or label. This is account-scoped.
 slop-proxy quota budget --user kader --account personal \
   --5hr-budget 25% --weekly-budget 25% --usd-budget 400
 
-# Replace all budgets: retain a five-hour budget and clear weekly/USD budgets
+# Without --account, percentage budgets apply across the user's whole fleet.
+slop-proxy quota budget --user kader --5hr-budget 50% --weekly-budget 50%
+
+# Replace all budgets: retain a five-hour budget and clear the other windows.
 slop-proxy quota budget --user kader --account personal --5hr-budget 25%
 
-# Clear both budgets for this user on this account
+# Clear both percentage budgets for this user on this account.
 slop-proxy quota budget --user kader --account personal
+
+# Clear both fleet-wide percentage budgets.
+slop-proxy quota budget --user kader
 ```
 
 Window budget values must include `%` and be between `0%` and `100%`. The
 `--usd-budget` value is a nonnegative dollar amount, such as `400` or `$400`.
-Each `quota budget` command replaces **all three** budgets for the selected
-user and account. An omitted budget is cleared (unlimited). No user budgets
+USD budgets remain account-scoped, so `--usd-budget` must be used together with
+`--account`. Each `quota budget` command replaces both percentage budgets for
+the selected target; an omitted budget is cleared (unlimited). For an
+account-scoped command, the USD budget is replaced too. No user budgets
 exist by default; `kader` stays unlimited unless you explicitly set one.
 Existing token limits and provider limits still apply.
+
+Fleet percentage budgets reset when the provider's five-hour or weekly epoch
+resets. The proxy reports percentage points against the remaining known fleet
+capacity from the current snapshots. Estimates are weighted across accounts,
+prefer public model prices when available, and fall back to weighted input,
+output, and cache token counts when prices are unavailable. These estimates are
+not exact token counts or provider billing figures.
 
 A `25%` budget allows estimated consumption of 25% of the account's full
 allowance, stored as **25 percentage points**. A reported estimate of 10 means

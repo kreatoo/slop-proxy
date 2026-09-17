@@ -79,7 +79,7 @@ pub fn pool_error_response(dialect: Dialect, models: &ModelsConfig, err: PoolErr
             dialect,
             429,
             err_type,
-            "estimated user quota budget or estimated USD budget exceeded for eligible accounts; retry after the budget window resets",
+            "estimated user quota budget or estimated USD budget exceeded; retry after the budget window resets",
          );
          if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
             resp.headers_mut().insert("retry-after", value);

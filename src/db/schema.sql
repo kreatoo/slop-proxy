@@ -127,6 +127,14 @@ CREATE TABLE IF NOT EXISTS user_quota_budgets (
   PRIMARY KEY (user, account_id, window_seconds)
 );
 
+-- Fleet-wide user quota budgets aggregate all OpenAI accounts equally.
+CREATE TABLE IF NOT EXISTS user_fleet_quota_budgets (
+  user TEXT NOT NULL CHECK (length(trim(user)) > 0),
+  window_seconds INTEGER NOT NULL CHECK (window_seconds IN (18000, 604800)),
+  budget_percent REAL NOT NULL CHECK (budget_percent BETWEEN 0 AND 100),
+  PRIMARY KEY (user, window_seconds)
+);
+
 -- Lifetime spend budgets have no automatic reset.
 CREATE TABLE IF NOT EXISTS user_spend_budgets (
   user       TEXT NOT NULL CHECK (length(trim(user)) > 0),

@@ -206,9 +206,9 @@ pub enum QuotaCommand {
    Budget {
       #[pound(long)]
       user: String,
-      /// Account id, email or label
+      /// Account id, email or label. Omit to apply percentage budgets across the user's fleet.
       #[pound(long)]
-      account: String,
+      account: Option<String>,
       /// User's estimated share of the five-hour allowance, such as 25%
       #[pound(long = "5hr-budget")]
       five_hour_budget: Option<String>,
@@ -564,9 +564,18 @@ async fn quota_command(db: &Db, cfg: &Config, command: QuotaCommand) -> Result<S
          weekly_budget,
          usd_budget,
       } => {
-         // Validate every value before changing any budget.
+         // Validate every value before changing any budget. USD budgets are
+         // account-scoped, while percentage budgets can target the whole fleet.
          let (five_hour_budget, weekly_budget) = quota_budgets(five_hour_budget, weekly_budget)?;
          let usd_budget = parse_usd_budget(usd_budget, "--usd-budget")?;
+         if account.is_none() && usd_budget.is_some() {
+            bail!("--usd-budget requires --account (USD budgets are account-scoped)");
+         }
+         let Some(account) = account else {
+            db.set_user_fleet_quota_budgets(&user, five_hour_budget, weekly_budget)
+               .await?;
+            return Ok(format!("updated fleet quota budgets for {user}"));
+         };
          let account_id = resolve_pin(db, Some(account))
             .await?
             .ok_or_else(|| eyre!("--account is required"))?;
@@ -953,6 +962,63 @@ mod tests {
    }
 
    #[tokio::test]
+   async fn quota_dispatch_without_account_sets_fleet_percentage_budgets() {
+      let (db, account) = quota_test_database().await;
+      dispatch_quota(
+         &db,
+         &[
+            "quota",
+            "budget",
+            "--user",
+            "kader",
+            "--5hr-budget",
+            "50%",
+            "--weekly-budget",
+            "25%",
+         ],
+      )
+      .await
+      .unwrap();
+      let rows = db.user_quota("kader", None).await.unwrap();
+      let fleet = rows
+         .iter()
+         .find(|row| row.account_id.is_none())
+         .expect("fleet row");
+      assert_eq!(fleet.window_seconds, 18_000);
+      assert_eq!(fleet.budget_percent, Some(50.0));
+      assert_eq!(fleet.fleet_capacity_points, Some(0.0));
+      assert!(rows.iter().all(|row| row.account_id != Some(account)));
+
+      // Cross-flag validation happens before replacing either fleet window.
+      let error = dispatch_quota(
+         &db,
+         &[
+            "quota",
+            "budget",
+            "--user",
+            "kader",
+            "--5hr-budget",
+            "80%",
+            "--usd-budget",
+            "400",
+         ],
+      )
+      .await
+      .unwrap_err()
+      .to_string();
+      assert!(error.contains("--usd-budget requires --account"), "{error}");
+      assert_eq!(
+         db.user_quota("kader", None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.account_id.is_none() && row.window_seconds == 18_000)
+            .and_then(|row| row.budget_percent),
+         Some(50.0)
+      );
+   }
+
+   #[tokio::test]
    async fn quota_usage_dispatch_serializes_unknown_observations_as_null() {
       let (db, account) = quota_test_database().await;
       let empty = dispatch_quota(&db, &["quota", "usage", "--user", "kader"])
@@ -1039,7 +1105,7 @@ mod tests {
          panic!("expected quota budget");
       };
       assert_eq!(user, "kader");
-      assert_eq!(account, "personal");
+      assert_eq!(account.as_deref(), Some("personal"));
       assert_eq!(usd_budget, None);
       assert_eq!(
          quota_budgets(five_hour_budget, weekly_budget).unwrap(),
@@ -1118,10 +1184,36 @@ mod tests {
    }
 
    #[test]
-   fn quota_commands_require_user_and_budget_requires_account() {
+   fn quota_commands_require_user_but_budget_account_is_optional() {
       assert!(Cli::try_parse_from(["quota", "usage"]).is_err());
       assert!(Cli::try_parse_from(["quota", "budget", "--account", "1"]).is_err());
-      assert!(Cli::try_parse_from(["quota", "budget", "--user", "kader"]).is_err());
+      let cli = Cli::try_parse_from(["quota", "budget", "--user", "kader"]).unwrap();
+      let Command::Quota {
+         command: QuotaCommand::Budget { account, .. },
+      } = cli.command
+      else {
+         panic!("expected quota budget");
+      };
+      assert_eq!(account, None);
+   }
+
+   #[test]
+   fn quota_budget_rejects_usd_without_account_before_dispatch() {
+      let cli = Cli::try_parse_from(["quota", "budget", "--user", "kader", "--usd-budget", "400"])
+         .unwrap();
+      let Command::Quota { command } = cli.command else {
+         panic!("expected quota");
+      };
+      // Dispatch performs this cross-flag validation because the parser accepts
+      // each flag independently.
+      assert!(matches!(
+         command,
+         QuotaCommand::Budget {
+            account: None,
+            usd_budget: Some(_),
+            ..
+         }
+      ));
    }
 
    #[test]

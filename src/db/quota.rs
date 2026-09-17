@@ -25,7 +25,8 @@ pub struct QuotaObservation {
 #[derive(Debug, Serialize)]
 pub struct UserQuotaReport {
    pub user: String,
-   pub account_id: i64,
+   /// Account-scoped reports carry an account id. Fleet rows use null.
+   pub account_id: Option<i64>,
    pub provider: String,
    pub window_seconds: i64,
    /// None means no current provider reading, rather than zero provider usage.
@@ -43,6 +44,10 @@ pub struct UserQuotaReport {
    pub spend_allowance_used_percent: Option<f64>,
    /// Estimated usage / assigned budget * 100. Undefined for a zero budget.
    pub allowance_used_percent: Option<f64>,
+   /// Fleet capacity and attribution are present only on fleet rows.
+   pub fleet_capacity_points: Option<f64>,
+   pub fleet_estimated_user_percent: Option<f64>,
+   pub fleet_allowance_used_percent: Option<f64>,
    pub baseline_percent: Option<f64>,
    /// Includes the initial baseline and later deltas without local work.
    pub unattributed_percent: Option<f64>,
@@ -117,35 +122,35 @@ impl Db {
          );
       }
       let user = user.to_owned();
-      self.call(move |conn| {
-         validate_account(conn, account_id)?;
-         if let Some(budget) = budget_usd {
-            conn.execute(
-               "INSERT INTO user_spend_budgets (user, account_id, budget_usd)
+      self
+         .call(move |conn| {
+            validate_account(conn, account_id)?;
+            if let Some(budget) = budget_usd {
+               conn.execute(
+                  "INSERT INTO user_spend_budgets (user, account_id, budget_usd)
                 VALUES (?1, ?2, ?3) ON CONFLICT(user, account_id)
                 DO UPDATE SET budget_usd = excluded.budget_usd",
-               params![user, account_id, budget],
-            )?;
-         } else {
-            conn.execute(
-               "DELETE FROM user_spend_budgets WHERE user = ?1 AND account_id = ?2",
-               params![user, account_id],
-            )?;
-         }
-         Ok(())
-      }).await
+                  params![user, account_id, budget],
+               )?;
+            } else {
+               conn.execute(
+                  "DELETE FROM user_spend_budgets WHERE user = ?1 AND account_id = ?2",
+                  params![user, account_id],
+               )?;
+            }
+            Ok(())
+         })
+         .await
    }
 
    /// Return a fixed retry delay when a lifetime spend budget is exhausted.
    /// Spend budgets have no provider reset to use for a more precise delay.
-   pub async fn user_spend_retry_after(
-      &self,
-      user: &str,
-      account_id: i64,
-   ) -> Result<Option<i64>> {
+   pub async fn user_spend_retry_after(&self, user: &str, account_id: i64) -> Result<Option<i64>> {
       ensure!(!user.trim().is_empty(), "quota user must not be empty");
       let user = user.to_owned();
-      self.call(move |conn| spend_retry_after(conn, &user, account_id)).await
+      self
+         .call(move |conn| spend_retry_after(conn, &user, account_id))
+         .await
    }
 
    // Test fixtures can update one window; the CLI replaces both atomically.
@@ -210,6 +215,53 @@ impl Db {
          txn.commit()?;
          Ok(())
       }).await
+   }
+
+   /// Replace both fleet-wide budgets together. None clears that window's budget.
+   pub async fn set_user_fleet_quota_budgets(
+      &self,
+      user: &str,
+      five_hour: Option<f64>,
+      weekly: Option<f64>,
+   ) -> Result<()> {
+      ensure!(!user.trim().is_empty(), "quota user must not be empty");
+      for percent in [five_hour, weekly].into_iter().flatten() {
+         ensure!(
+            percent.is_finite() && (0.0_f64..=100.0_f64).contains(&percent),
+            "quota budget must be finite and between 0 and 100 percent"
+         );
+      }
+      let user = user.to_owned();
+      self
+         .call(move |conn| {
+            let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for (window, percent) in [(18000, five_hour), (604_800, weekly)] {
+               if let Some(percent) = percent {
+                  txn.execute(
+                     "INSERT INTO user_fleet_quota_budgets (user, window_seconds, budget_percent)
+                  VALUES (?1, ?2, ?3) ON CONFLICT(user, window_seconds)
+                  DO UPDATE SET budget_percent = excluded.budget_percent",
+                     params![user, window, percent],
+                  )?;
+               } else {
+                  txn.execute(
+                     "DELETE FROM user_fleet_quota_budgets WHERE user = ?1 AND window_seconds = ?2",
+                     params![user, window],
+                  )?;
+               }
+            }
+            txn.commit()?;
+            Ok(())
+         })
+         .await
+   }
+
+   pub async fn user_fleet_quota_retry_after(&self, user: &str) -> Result<Option<i64>> {
+      ensure!(!user.trim().is_empty(), "quota user must not be empty");
+      let user = user.to_owned();
+      self
+         .call(move |conn| fleet_retry_after(conn, &user, clock::unix_now()))
+         .await
    }
 
    pub async fn user_quota_retry_after(&self, user: &str, account_id: i64) -> Result<Option<i64>> {
@@ -364,6 +416,98 @@ fn observe(conn: &mut Connection, sample: &QuotaObservation) -> Result<()> {
    Ok(())
 }
 
+fn fleet_reports(conn: &Connection, user: &str, now: i64) -> Result<Vec<UserQuotaReport>> {
+   let mut stmt = conn.prepare(
+      "WITH current AS (
+      SELECT e.* FROM quota_epochs e WHERE e.resets_at > ?2 AND e.account_id IN
+         (SELECT id FROM accounts WHERE provider = 'openai')
+         AND NOT EXISTS (SELECT 1 FROM quota_epochs newer WHERE newer.account_id = e.account_id
+            AND newer.window_seconds = e.window_seconds AND newer.resets_at > e.resets_at)
+   ), windows AS (
+      -- Fleet rows are policy rows: keep the legacy all-account report
+      -- unchanged unless this user has a fleet budget configured.
+      SELECT window_seconds FROM user_fleet_quota_budgets WHERE user = ?1
+   ), aggregates AS (
+      SELECT w.window_seconds,
+         COALESCE(SUM(MAX(100.0 - e.baseline_percent, 0.0)), 0.0) AS capacity,
+         COALESCE(SUM(e.observed_percent), 0.0) AS observed,
+         MIN(e.resets_at) AS reset_at, MIN(e.observed_at) AS observed_at,
+         COALESCE(SUM(e.unattributed_percent), 0.0) AS unattributed
+      FROM windows w LEFT JOIN current e ON e.window_seconds = w.window_seconds
+      GROUP BY w.window_seconds
+   ), estimates AS (
+      SELECT e.window_seconds, COALESCE(SUM(u.used_percent), 0.0) AS used
+      FROM current e LEFT JOIN user_quota_estimates u ON u.account_id = e.account_id
+         AND u.window_seconds = e.window_seconds AND u.resets_at = e.resets_at AND u.user = ?1
+      GROUP BY e.window_seconds
+   ) SELECT a.window_seconds, a.capacity, a.observed, a.reset_at, a.observed_at, a.unattributed,
+      x.used, b.budget_percent
+      FROM aggregates a LEFT JOIN estimates x ON x.window_seconds = a.window_seconds
+      LEFT JOIN user_fleet_quota_budgets b ON b.user = ?1 AND b.window_seconds = a.window_seconds
+      ORDER BY a.window_seconds",
+   )?;
+   let rows = stmt
+      .query_map(params![user, now], |row| {
+         let window_seconds: i64 = row.get(0)?;
+         let capacity: f64 = row.get(1)?;
+         let observed: f64 = row.get(2)?;
+         let resets_at: Option<i64> = row.get(3)?;
+         let observed_at: Option<i64> = row.get(4)?;
+         let unattributed: f64 = row.get(5)?;
+         let estimate: f64 = row.get::<_, Option<f64>>(6)?.unwrap_or(0.0);
+         let budget: Option<f64> = row.get(7)?;
+         let allowance = budget.map(|value| capacity * value / 100.0);
+         Ok(UserQuotaReport {
+            user: user.to_owned(),
+            account_id: None,
+            provider: "openai".to_owned(),
+            window_seconds,
+            resets_at,
+            observed_used_percent: resets_at.map(|_| observed),
+            estimated_user_percent: estimate,
+            budget_percent: budget,
+            estimated_cost_usd: 0.0,
+            spend_budget_usd: None,
+            spend_allowance_used_percent: None,
+            allowance_used_percent: allowance.filter(|v| *v > 0.0).map(|v| estimate / v * 100.0),
+            fleet_capacity_points: Some(capacity),
+            fleet_estimated_user_percent: Some(estimate),
+            fleet_allowance_used_percent: allowance
+               .filter(|v| *v > 0.0)
+               .map(|v| estimate / v * 100.0),
+            baseline_percent: None,
+            unattributed_percent: resets_at.map(|_| unattributed),
+            observed_at,
+            estimated: true,
+         })
+      })?
+      .collect::<rusqlite::Result<Vec<_>>>()?;
+   Ok(rows)
+}
+
+fn fleet_retry_after(conn: &Connection, user: &str, now: i64) -> Result<Option<i64>> {
+   let mut result = None;
+   for report in fleet_reports(conn, user, now)? {
+      let Some(budget) = report.budget_percent else {
+         continue;
+      };
+      let capacity = report.fleet_capacity_points.unwrap_or(0.0);
+      let estimate = report.fleet_estimated_user_percent.unwrap_or(0.0);
+      let exhausted = if budget == 0.0 {
+         true
+      } else {
+         capacity > 0.0 && estimate >= capacity * budget / 100.0
+      };
+      if exhausted {
+         let delay = report
+            .resets_at
+            .map_or(60, |reset| reset.saturating_sub(now).max(1));
+         result = Some(result.unwrap_or(0).max(delay));
+      }
+   }
+   Ok(result)
+}
+
 fn reports(
    conn: &Connection,
    user: &str,
@@ -411,7 +555,7 @@ fn reports(
          let spend_budget_usd: Option<f64> = row.get(11)?;
          Ok(UserQuotaReport {
             user: user.to_owned(),
-            account_id: row.get(0)?,
+            account_id: Some(row.get(0)?),
             provider: row.get(1)?,
             window_seconds: row.get(2)?,
             resets_at,
@@ -421,6 +565,9 @@ fn reports(
             allowance_used_percent: budget
                .filter(|value| *value > 0.0_f64 && resets_at.is_some())
                .map(|value| consumption / value * 100.0_f64),
+            fleet_capacity_points: None,
+            fleet_estimated_user_percent: None,
+            fleet_allowance_used_percent: None,
             estimated_cost_usd,
             spend_budget_usd,
             spend_allowance_used_percent: spend_budget_usd
@@ -433,6 +580,10 @@ fn reports(
          })
       })?
       .collect::<rusqlite::Result<Vec<_>>>()?;
+   let mut rows = rows;
+   if account_id.is_none() {
+      rows.extend(fleet_reports(conn, user, now)?);
+   }
    Ok(rows)
 }
 
@@ -637,6 +788,55 @@ mod tests {
       close(
          report(&db, "alice", other).await.estimated_user_percent,
          2.0,
+      );
+   }
+
+   #[tokio::test]
+   async fn fleet_budget_uses_remaining_capacity_and_aggregates_accounts() {
+      let (db, _) = database();
+      let first = account(&db, "openai").await;
+      let second = account(&db, "openai").await;
+      let now = clock::unix_now();
+      sample(&db, first, now + 18000, now, 80.0).await;
+      sample(&db, second, now + 18000, now, 80.0).await;
+      db.set_user_fleet_quota_budgets("alice", Some(50.0), None)
+         .await
+         .unwrap();
+      let fleet = db
+         .user_quota("alice", None)
+         .await
+         .unwrap()
+         .into_iter()
+         .find(|row| row.account_id.is_none())
+         .expect("fleet report");
+      close(fleet.fleet_capacity_points.unwrap(), 40.0);
+      close(fleet.fleet_allowance_used_percent.unwrap(), 0.0);
+      work(&db, first, "alice", 1.0, 100, 0).await;
+      work(&db, second, "alice", 1.0, 100, 0).await;
+      sample(&db, first, now + 18000, now + 1, 85.0).await;
+      sample(&db, second, now + 18000, now + 1, 85.0).await;
+      let fleet = db
+         .user_quota("alice", None)
+         .await
+         .unwrap()
+         .into_iter()
+         .find(|row| row.account_id.is_none())
+         .unwrap();
+      close(fleet.fleet_estimated_user_percent.unwrap(), 10.0);
+      assert!(
+         db.user_fleet_quota_retry_after("alice")
+            .await
+            .unwrap()
+            .is_none()
+      );
+      db.set_user_fleet_quota_budgets("alice", Some(0.0), None)
+         .await
+         .unwrap();
+      assert!(
+         db.user_fleet_quota_retry_after("alice")
+            .await
+            .unwrap()
+            .is_some()
       );
    }
 

@@ -485,6 +485,9 @@ impl Pool<CodexClient> {
    ) -> Result<bool, PoolError> {
       // Called for every response.create, including requests on an existing
       // socket without a service tier. Handshake admission alone is not enough.
+      if let Some(retry_after) = self.fleet_quota_retry_after(route).await? {
+         return Err(PoolError::UserQuotaExceeded { retry_after });
+      }
       if let Some(id) = account_id
          && let Some(retry_after) = self.user_quota_retry_after(route, id).await?
       {
@@ -635,7 +638,7 @@ mod quota_poll_tests {
       assert_eq!(baseline[0].window_seconds, 18_000);
       assert_eq!(baseline[0].baseline_percent, Some(25.0_f64));
       assert_eq!(baseline[0].estimated_user_percent, 0.0_f64);
-      let account = baseline[0].account_id;
+      let account = baseline[0].account_id.expect("account-scoped report");
       // Move only the test timestamp back so two polls in the same second are
       // distinct snapshots, without a wall-clock sleep in the test.
       db.call(|conn| {
