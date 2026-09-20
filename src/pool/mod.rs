@@ -456,6 +456,35 @@ impl<B: Backend> Pool<B> {
       }
    }
 
+   async fn quota_retry_after_for_filtered_accounts(
+      &self,
+      route: Route<'_>,
+   ) -> Result<Option<i64>, PoolError> {
+      if B::PROVIDER != Provider::OpenAi {
+         return Ok(None);
+      }
+      let mut retry_after = None;
+      for slot in self.slots.list().await {
+         if route.pinned_account.is_some_and(|id| id != slot.id)
+            || !slot.serves(route.user)
+            || self.slots.is_disabled(&slot).await
+         {
+            continue;
+         }
+         if let Some(retry) = self
+            .slots
+            .quota_limit_retry_after(&slot, route.five_hour_limit, route.weekly_limit)
+            .await
+         {
+            retry_after = Some(retry_after.map_or(retry, |old: i64| old.min(retry)));
+         }
+         if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
+            retry_after = Some(retry_after.map_or(retry, |old: i64| old.min(retry)));
+         }
+      }
+      Ok(retry_after)
+   }
+
    async fn sweep(
       &self,
       route: Route<'_>,
@@ -463,6 +492,9 @@ impl<B: Backend> Pool<B> {
    ) -> Result<(Option<i64>, B::Response), PoolError> {
       let ranked = self.ranked(route).await;
       if ranked.is_empty() {
+         if let Some(retry_after) = self.quota_retry_after_for_filtered_accounts(route).await? {
+            return Err(PoolError::UserQuotaExceeded { retry_after });
+         }
          if B::PROVIDER == Provider::OpenAi
             && let Some(tier) = route.explicit_tier()
          {
@@ -910,6 +942,42 @@ mod user_quota_tests {
             .len(),
          2
       );
+   }
+
+   #[tokio::test]
+   async fn token_quota_limits_report_quota_instead_of_missing_accounts() {
+      let (_, pool) = pool().await;
+      let resets_at = clock::unix_now() + 300;
+      for slot in pool.slots.list().await {
+         pool
+            .slots
+            .note_usage(
+               &slot,
+               AccountUsage {
+                  windows: vec![UsageWindow {
+                     name: "5h".into(),
+                     utilization: 0.5_f64,
+                     resets_at: Some(resets_at),
+                  }],
+                  ..AccountUsage::default()
+               },
+            )
+            .await;
+      }
+      let blocked = pool
+         .execute(
+            Route {
+               five_hour_limit: Some(0.5_f64),
+               ..route()
+            },
+            (),
+         )
+         .await;
+      assert!(matches!(
+         blocked,
+         Err(PoolError::UserQuotaExceeded { retry_after }) if retry_after >= 60
+      ));
+      assert_eq!(pool.backend.0.load(Ordering::SeqCst), 0);
    }
 
    #[tokio::test]

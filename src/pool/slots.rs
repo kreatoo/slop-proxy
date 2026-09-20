@@ -408,14 +408,43 @@ impl Slots {
       five_hour_limit: Option<f64>,
       weekly_limit: Option<f64>,
    ) -> bool {
+      self
+         .quota_limit_retry_after(slot, five_hour_limit, weekly_limit)
+         .await
+         .is_none()
+   }
+
+   /// Retry delay for a token cap that filtered this account from routing.
+   /// Keeping this separate from `within_quota_limits` lets the pool report a
+   /// quota response instead of pretending that configured accounts are absent.
+   pub async fn quota_limit_retry_after(
+      &self,
+      slot: &Slot,
+      five_hour_limit: Option<f64>,
+      weekly_limit: Option<f64>,
+   ) -> Option<i64> {
       if five_hour_limit.is_none() && weekly_limit.is_none() {
-         return true;
+         return None;
       }
       let state = slot.state.lock().await;
-      let Some(usage) = state.usage.as_ref() else {
-         return true;
-      };
-      Self::quota_allows(usage, five_hour_limit, weekly_limit)
+      let usage = state.usage.as_ref()?;
+      let now = clock::unix_now();
+      usage
+         .windows
+         .iter()
+         .filter_map(|window| {
+            let limit = match window_seconds(&window.name) {
+               Some(18_000) => five_hour_limit,
+               Some(604_800) => weekly_limit,
+               _ => None,
+            }?;
+            (window.utilization >= limit).then(|| {
+               window
+                  .resets_at
+                  .map_or(60, |resets_at| (resets_at - now).max(60))
+            })
+         })
+         .min()
    }
 
    fn quota_allows(
