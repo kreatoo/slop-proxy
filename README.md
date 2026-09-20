@@ -162,7 +162,10 @@ allows half of the resulting weighted capacity. Personal accounts whose
 allowlist names exactly one user are excluded from fleet budgets.
 
 ```sh
-# JSON report across accounts, or for one account
+# Human-readable table for every configured fleet budget.
+slop-proxy quota fleet
+
+# Detailed JSON report across accounts, or for one account.
 slop-proxy quota usage --user kader
 slop-proxy quota usage --user kader --account personal
 

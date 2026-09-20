@@ -106,6 +106,28 @@ impl Db {
          .await
    }
 
+   /// Fleet budget rows for every user with a configured fleet policy.
+   pub async fn fleet_quotas(&self) -> Result<Vec<UserQuotaReport>> {
+      self
+         .reports
+         .call(move |conn| {
+            let users = {
+               let mut stmt = conn
+                  .prepare("SELECT DISTINCT user FROM user_fleet_quota_budgets ORDER BY user")?;
+               stmt
+                  .query_map([], |row| row.get::<_, String>(0))?
+                  .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let now = clock::unix_now();
+            let mut rows = Vec::new();
+            for user in users {
+               rows.extend(fleet_reports(conn, &user, now)?);
+            }
+            Ok(rows)
+         })
+         .await
+   }
+
    /// Set or clear a lifetime spend budget. There is no automatic reset;
    /// callers can clear and replace the budget explicitly.
    pub async fn set_user_spend_budget(

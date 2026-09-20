@@ -200,6 +200,8 @@ pub enum QuotaCommand {
       #[pound(long)]
       account: Option<String>,
    },
+   /// Show configured fleet budgets and remaining allowance as a table
+   Fleet,
    /// Show provider-reported quota usage for all accounts as a table
    Accounts,
    /// Replace both user budgets for an account; omitted budgets are unlimited
@@ -551,6 +553,7 @@ fn parse_percentage(raw: Option<String>, flag: &str) -> Result<Option<f64>> {
 
 async fn quota_command(db: &Db, cfg: &Config, command: QuotaCommand) -> Result<String> {
    match command {
+      QuotaCommand::Fleet => quota_fleet(db).await,
       QuotaCommand::Accounts => quota_accounts(db, cfg).await,
       QuotaCommand::Usage { user, account } => {
          let account_id = resolve_pin(db, account).await?;
@@ -591,6 +594,85 @@ async fn quota_command(db: &Db, cfg: &Config, command: QuotaCommand) -> Result<S
          ))
       },
    }
+}
+
+fn compact_number(value: f64) -> String {
+   let formatted = format!("{value:.2}");
+   formatted
+      .trim_end_matches('0')
+      .trim_end_matches('.')
+      .to_owned()
+}
+
+fn quota_reset_in(resets_at: Option<i64>, now: i64) -> String {
+   let Some(resets_at) = resets_at else {
+      return "-".into();
+   };
+   let seconds = resets_at.saturating_sub(now).max(0);
+   let days = seconds / 86_400;
+   let hours = seconds % 86_400 / 3_600;
+   let minutes = seconds % 3_600 / 60;
+   if days > 0 {
+      format!("{days}d {hours}h")
+   } else if hours > 0 {
+      format!("{hours}h {minutes}m")
+   } else {
+      format!("{minutes}m")
+   }
+}
+
+async fn quota_fleet(db: &Db) -> Result<String> {
+   let rows = db.fleet_quotas().await?;
+   let mut out = String::from(
+      "USER              WINDOW  BUDGET  ALLOWANCE  USED       USED%    LEFT       LEFT%    RESETS IN
+",
+   );
+   out.push_str(
+      "----------------  ------  ------  ---------  ---------  -------  ---------  -------  ---------
+",
+   );
+   let now = clock::unix_now();
+   for row in rows {
+      let Some(budget) = row.budget_percent else {
+         continue;
+      };
+      let capacity = row.fleet_capacity_points.unwrap_or(0.0_f64);
+      let used = row.fleet_estimated_user_percent.unwrap_or(0.0_f64);
+      let allowance = capacity * budget / 100.0_f64;
+      let left = (allowance - used).max(0.0_f64);
+      let (used_percent, left_percent) = row.fleet_allowance_used_percent.map_or_else(
+         || ("-".into(), "-".into()),
+         |percent| {
+            (
+               format!("{}%", compact_number(percent)),
+               format!("{}%", compact_number((100.0_f64 - percent).max(0.0_f64))),
+            )
+         },
+      );
+      let window = match row.window_seconds {
+         18_000 => "5H",
+         604_800 => "WEEKLY",
+         _ => "OTHER",
+      };
+      out.push_str(&format!(
+         "{:<16}  {:<6}  {:>6}  {:>9}  {:>9}  {:>7}  {:>9}  {:>7}  {}
+",
+         row.user,
+         window,
+         format!("{}%", compact_number(budget)),
+         compact_number(allowance),
+         compact_number(used),
+         used_percent,
+         compact_number(left),
+         left_percent,
+         quota_reset_in(row.resets_at, now),
+      ));
+   }
+   out.push_str(
+      "
+Weighted points: Plus 1x, Prolite 5x, Pro 20x. Personal accounts are excluded.",
+   );
+   Ok(out)
 }
 
 async fn quota_accounts(db: &Db, cfg: &Config) -> Result<String> {
@@ -801,6 +883,7 @@ mod tests {
    use std::env;
 
    use crate::config::Config;
+   use crate::db::quota::QuotaObservation;
    use crate::oauth::TokenSet;
    use crate::provider::{AuthMode, Provider};
    use pound::Parse as _;
@@ -1016,6 +1099,45 @@ mod tests {
             .and_then(|row| row.budget_percent),
          Some(50.0)
       );
+   }
+
+   #[tokio::test]
+   async fn quota_fleet_dispatch_formats_remaining_allowance() {
+      let (db, account) = quota_test_database().await;
+      let now = crate::clock::unix_now();
+      db.observe_quota(QuotaObservation {
+         account_id: account,
+         window_seconds: 604_800,
+         resets_at: now + 604_800,
+         used_percent: 20.0_f64,
+         observed_at: now,
+      })
+      .await
+      .unwrap();
+      dispatch_quota(
+         &db,
+         &[
+            "quota",
+            "budget",
+            "--user",
+            "kader",
+            "--weekly-budget",
+            "50%",
+         ],
+      )
+      .await
+      .unwrap();
+      let table = dispatch_quota(&db, &["quota", "fleet"]).await.unwrap();
+      assert!(table.contains("USER"));
+      assert!(table.contains("ALLOWANCE"));
+      assert!(table.lines().any(|line| {
+         line.contains("kader")
+            && line.contains("WEEKLY")
+            && line.contains("50%")
+            && line.contains("40")
+            && line.contains("100%")
+      }));
+      assert!(table.contains("Plus 1x, Prolite 5x, Pro 20x"));
    }
 
    #[tokio::test]
