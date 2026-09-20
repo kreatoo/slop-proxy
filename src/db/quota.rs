@@ -55,6 +55,8 @@ pub struct UserQuotaReport {
    pub estimated: bool,
 }
 
+const RESET_DRIFT_TOLERANCE_SECS: i64 = 60;
+
 fn validate_window(window_seconds: i64) -> Result<()> {
    ensure!(
       matches!(window_seconds, 18000 | 604_800),
@@ -354,7 +356,9 @@ fn observe(conn: &mut Connection, sample: &QuotaObservation) -> Result<()> {
       )
       .optional()?;
    if previous.is_some_and(|(reset, observed, _, _)| {
-      sample.resets_at < reset || sample.observed_at <= observed
+      (sample.resets_at < reset
+         && reset.saturating_sub(sample.resets_at) > RESET_DRIFT_TOLERANCE_SECS)
+         || sample.observed_at <= observed
    }) {
       // Preserve stale samples for auditing, but never move a ledger backwards.
       txn.commit()?;
@@ -365,7 +369,9 @@ fn observe(conn: &mut Connection, sample: &QuotaObservation) -> Result<()> {
       params![sample.account_id, sample.observed_at], |row| row.get(0),
    )?;
    match previous {
-      Some((reset, _, high_water, cursor)) if reset == sample.resets_at => {
+      Some((reset, _, high_water, cursor))
+         if (sample.resets_at - reset).abs() <= RESET_DRIFT_TOLERANCE_SECS =>
+      {
          let delta = (sample.used_percent - high_water).max(0.0);
          let mut unattributed = 0.0_f64;
          if delta > 0.0_f64 {
@@ -410,7 +416,7 @@ fn observe(conn: &mut Connection, sample: &QuotaObservation) -> Result<()> {
                   txn.execute("INSERT INTO user_quota_estimates (user, account_id, window_seconds, resets_at, used_percent)
                      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(user, account_id, window_seconds, resets_at)
                      DO UPDATE SET used_percent = used_percent + excluded.used_percent",
-                     params![user, sample.account_id, sample.window_seconds, sample.resets_at, share])?;
+                     params![user, sample.account_id, sample.window_seconds, reset, share])?;
                }
             } else {
                unattributed = delta;
@@ -422,7 +428,7 @@ fn observe(conn: &mut Connection, sample: &QuotaObservation) -> Result<()> {
          txn.execute("UPDATE quota_epochs SET observed_percent = ?4, observed_at = ?5,
             high_water_percent = MAX(high_water_percent, ?4), unattributed_percent = unattributed_percent + ?6,
             usage_cursor = ?7 WHERE account_id = ?1 AND window_seconds = ?2 AND resets_at = ?3",
-            params![sample.account_id, sample.window_seconds, sample.resets_at, sample.used_percent,
+            params![sample.account_id, sample.window_seconds, reset, sample.used_percent,
                sample.observed_at, unattributed, if delta > 0.0_f64 { end_cursor.max(cursor) } else { cursor }])?;
       },
       _ => {
@@ -699,6 +705,29 @@ mod tests {
          report(&db, "alice", id).await.unattributed_percent,
          Some(45.0)
       );
+   }
+
+   #[tokio::test]
+   async fn reset_timestamp_drift_keeps_the_same_epoch() {
+      let (db, _) = database();
+      let id = account(&db, "openai").await;
+      let now = clock::unix_now();
+      work(&db, id, "alice", 1.0, 100, 0).await;
+      sample(&db, id, now + 604_800, now, 10.0).await;
+      work(&db, id, "alice", 1.0, 100, 0).await;
+      sample(&db, id, now + 604_801, now + 1, 11.0).await;
+      close(report(&db, "alice", id).await.estimated_user_percent, 1.0);
+      db.call(move |conn| {
+         let epochs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM quota_epochs WHERE account_id = ?1",
+            [id],
+            |row| row.get(0),
+         )?;
+         assert_eq!(epochs, 1);
+         Ok(())
+      })
+      .await
+      .unwrap();
    }
 
    #[tokio::test]
