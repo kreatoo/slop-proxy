@@ -153,12 +153,13 @@ Reports and budgets can be per account or fleet-wide, and always refer to a
 provider subscription window rather than the rolling `--window-seconds` windows
 used for request and token limits. With `--account`, a percentage is a share of
 that account's allowance. Without `--account`, percentage budgets apply to the
-user's fleet: they are a share of the remaining known capacity across all
-accounts at the current provider-epoch snapshots. For example, if two accounts
-are each at 80%, the fleet has 40 percentage points remaining, so a 50% fleet
-budget allows 20 points. If two users each have a 50% fleet budget, each gets 20
-points from that 40-point fleet capacity—not 10 points. If the example instead
-uses a 20-point per-account budget, each user gets 10 points per account.
+user's fleet: they are a share of the remaining known capacity across shared
+accounts at the current provider-epoch snapshots. Capacity and attributed usage
+are weighted by subscription plan: Plus is 1x, Prolite is 5x, and Pro is 20x.
+For example, 20 remaining points on a Pro account contribute 400 fleet points,
+while 20 remaining points on a Plus account contribute 20. A 50% fleet budget
+allows half of the resulting weighted capacity. Personal accounts whose
+allowlist names exactly one user are excluded from fleet budgets.
 
 ```sh
 # JSON report across accounts, or for one account

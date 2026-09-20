@@ -419,9 +419,11 @@ fn observe(conn: &mut Connection, sample: &QuotaObservation) -> Result<()> {
 fn fleet_reports(conn: &Connection, user: &str, now: i64) -> Result<Vec<UserQuotaReport>> {
    let mut stmt = conn.prepare(
       "WITH current AS (
-      SELECT e.* FROM quota_epochs e WHERE e.resets_at > ?2 AND e.account_id IN
-         (SELECT id FROM accounts WHERE provider = 'openai'
-            AND (allowed_users = '' OR length(allowed_users) - length(replace(allowed_users, ',', '')) >= 1))
+      SELECT e.*, CASE lower(COALESCE(a.plan_type, ''))
+         WHEN 'pro' THEN 20.0 WHEN 'prolite' THEN 5.0 ELSE 1.0 END AS plan_weight
+      FROM quota_epochs e JOIN accounts a ON a.id = e.account_id
+      WHERE e.resets_at > ?2 AND a.provider = 'openai'
+         AND (a.allowed_users = '' OR length(a.allowed_users) - length(replace(a.allowed_users, ',', '')) >= 1)
          AND NOT EXISTS (SELECT 1 FROM quota_epochs newer WHERE newer.account_id = e.account_id
             AND newer.window_seconds = e.window_seconds AND newer.resets_at > e.resets_at)
    ), windows AS (
@@ -430,14 +432,14 @@ fn fleet_reports(conn: &Connection, user: &str, now: i64) -> Result<Vec<UserQuot
       SELECT window_seconds FROM user_fleet_quota_budgets WHERE user = ?1
    ), aggregates AS (
       SELECT w.window_seconds,
-         COALESCE(SUM(MAX(100.0 - e.baseline_percent, 0.0)), 0.0) AS capacity,
-         COALESCE(SUM(e.observed_percent), 0.0) AS observed,
+         COALESCE(SUM(MAX(100.0 - e.baseline_percent, 0.0) * e.plan_weight), 0.0) AS capacity,
+         COALESCE(SUM(e.observed_percent * e.plan_weight), 0.0) AS observed,
          MIN(e.resets_at) AS reset_at, MIN(e.observed_at) AS observed_at,
-         COALESCE(SUM(e.unattributed_percent), 0.0) AS unattributed
+         COALESCE(SUM(e.unattributed_percent * e.plan_weight), 0.0) AS unattributed
       FROM windows w LEFT JOIN current e ON e.window_seconds = w.window_seconds
       GROUP BY w.window_seconds
    ), estimates AS (
-      SELECT e.window_seconds, COALESCE(SUM(u.used_percent), 0.0) AS used
+      SELECT e.window_seconds, COALESCE(SUM(u.used_percent * e.plan_weight), 0.0) AS used
       FROM current e LEFT JOIN user_quota_estimates u ON u.account_id = e.account_id
          AND u.window_seconds = e.window_seconds AND u.resets_at = e.resets_at AND u.user = ?1
       GROUP BY e.window_seconds
@@ -833,6 +835,55 @@ mod tests {
       db.set_user_fleet_quota_budgets("alice", Some(0.0), None)
          .await
          .unwrap();
+      assert!(
+         db.user_fleet_quota_retry_after("alice")
+            .await
+            .unwrap()
+            .is_some()
+      );
+   }
+
+   #[tokio::test]
+   async fn fleet_budget_weights_subscription_plans() {
+      let (db, _) = database();
+      let pro = account(&db, "openai").await;
+      let plus = account(&db, "openai").await;
+      let prolite = account(&db, "openai").await;
+      db.call(move |conn| {
+         conn.execute("UPDATE accounts SET plan_type = 'pro' WHERE id = ?1", [pro])?;
+         conn.execute(
+            "UPDATE accounts SET plan_type = 'plus' WHERE id = ?1",
+            [plus],
+         )?;
+         conn.execute(
+            "UPDATE accounts SET plan_type = 'prolite' WHERE id = ?1",
+            [prolite],
+         )?;
+         Ok(())
+      })
+      .await
+      .unwrap();
+      let now = clock::unix_now();
+      for id in [pro, plus, prolite] {
+         sample(&db, id, now + 18000, now, 80.0).await;
+         work(&db, id, "alice", 1.0, 100, 0).await;
+         sample(&db, id, now + 18000, now + 1, 90.0).await;
+      }
+      db.set_user_fleet_quota_budgets("alice", Some(50.0), None)
+         .await
+         .unwrap();
+      let fleet = db
+         .user_quota("alice", None)
+         .await
+         .unwrap()
+         .into_iter()
+         .find(|row| row.account_id.is_none())
+         .expect("fleet report");
+      // 20 remaining points weighted as pro=20, plus=1, prolite=5.
+      close(fleet.fleet_capacity_points.unwrap(), 520.0);
+      // 10 attributed points from each account use the same weights.
+      close(fleet.fleet_estimated_user_percent.unwrap(), 260.0);
+      close(fleet.fleet_allowance_used_percent.unwrap(), 100.0);
       assert!(
          db.user_fleet_quota_retry_after("alice")
             .await
