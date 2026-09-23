@@ -158,6 +158,11 @@ impl Db {
    pub async fn list_accounts(&self) -> Result<Vec<Account>> {
       self
          .call(move |conn| {
+            conn.execute(
+               "UPDATE accounts SET status = 'active', cooldown_until = NULL, updated_at = unixepoch()
+                WHERE status = 'cooldown' AND cooldown_until IS NOT NULL AND cooldown_until <= unixepoch()",
+               [],
+            )?;
             let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM accounts ORDER BY id"))?;
             let rows = stmt.query_map([], from_row)?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
