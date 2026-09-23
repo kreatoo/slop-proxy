@@ -167,6 +167,18 @@ fn opening(head: &[u8]) -> Opening {
    Opening::Pending
 }
 
+fn is_caller_refusal(body: &str) -> bool {
+   [
+      "cyber_policy",
+      "invalid_prompt",
+      "context_length_exceeded",
+      "invalid_encrypted_content",
+      "previous_response_not_found",
+   ]
+   .iter()
+   .any(|code| body.contains(code))
+}
+
 async fn refuse_early(resp: reqwest::Response) -> Result<reqwest::Response, SendError> {
    let status = resp.status();
    let headers = resp.headers().clone();
@@ -180,6 +192,9 @@ async fn refuse_early(resp: reqwest::Response) -> Result<reqwest::Response, Send
          Opening::Serve => break,
          Opening::Undecryptable => return Err(SendError::BadRequest(UNDECRYPTABLE.into())),
          Opening::Refused(body) => {
+            if is_caller_refusal(&body) {
+               return Err(SendError::BadRequest(body));
+            }
             let spent = [
                "usage_limit_reached",
                "usage_not_included",
@@ -492,6 +507,9 @@ mod tests {
          opening(&head(&[created, capacity])),
          Opening::Refused(_)
       ));
+      assert!(is_caller_refusal(r#"{"code":"cyber_policy"}"#));
+      assert!(is_caller_refusal(r#"{"code":"invalid_prompt"}"#));
+      assert!(!is_caller_refusal(r#"{"code":"rate_limit_exceeded"}"#));
       assert!(matches!(opening(&head(&[created, bad])), Opening::Serve));
       assert!(matches!(opening(&head(&[created, failed])), Opening::Serve));
       assert!(matches!(opening(&head(&[created, output])), Opening::Serve));
