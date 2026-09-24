@@ -295,7 +295,7 @@ mod tests {
          headers["x-codex-routing-hint"],
          "model=gpt-6-astra,feature=enabled"
       );
-      assert_eq!(headers["version"], "0.153.4");
+      assert_eq!(headers["version"], "0.156.1");
       assert_eq!(headers["session-id"], "session");
       assert_eq!(headers["thread-id"], "session");
    }

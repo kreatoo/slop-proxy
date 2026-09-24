@@ -92,7 +92,7 @@ fn upgrade_request(base: &str) -> Request<()> {
       ("chatgpt-account-id", "untrusted-account"),
       ("cookie", "do-not-forward=secret"),
       ("openai-beta", "responses_websockets=2026-02-06"),
-      ("version", "0.153.4"),
+      ("version", "0.156.1"),
       ("originator", "codex_exec"),
       ("session-id", "session-from-client"),
       ("thread-id", "thread-from-client"),

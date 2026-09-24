@@ -173,8 +173,8 @@ impl Default for CodexConfig {
       Self {
          base_url: "https://chatgpt.com/backend-api/codex".into(),
          originator: "codex_cli_rs".into(),
-         user_agent: "codex_cli_rs/0.153.4 (Linux; x86_64)".into(),
-         version: "0.153.4".into(),
+         user_agent: "codex_cli_rs/0.156.1 (Linux; x86_64)".into(),
+         version: "0.156.1".into(),
          instructions: None,
          instructions_file: None,
          forward_max_tokens: true,
