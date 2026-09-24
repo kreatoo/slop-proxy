@@ -147,9 +147,12 @@ pub fn fast_base_slug(requested: &str) -> Option<&str> {
 }
 
 impl ModelInfo {
+   /// Returns whether the backend reports this model as usable through the API.
+   ///
+   /// `visibility` is a client presentation hint. A hidden model can still be
+   /// explicitly requested, so it must remain discoverable through the proxy.
    pub fn listed(&self) -> bool {
-      !matches!(self.visibility.as_deref(), Some("none" | "hide"))
-         && self.supported_in_api != Some(false)
+      self.supported_in_api != Some(false)
    }
 }
 
@@ -246,6 +249,29 @@ pub fn with_zen_entries(raw: &str, template: &str, ids: &[String]) -> Option<Str
       models.push(Value::Object(entry));
    }
    serde_json::to_string(&catalog).ok()
+}
+
+#[cfg(test)]
+mod tests {
+   use super::ModelInfo;
+
+   #[test]
+   fn api_supported_hidden_models_remain_discoverable() {
+      let model: ModelInfo = serde_json::from_str(
+         r#"{"slug":"provider-new-model","visibility":"hide","supported_in_api":true}"#,
+      )
+      .unwrap();
+      assert!(model.listed());
+   }
+
+   #[test]
+   fn explicitly_unsupported_models_remain_hidden() {
+      let model: ModelInfo = serde_json::from_str(
+         r#"{"slug":"provider-internal-model","visibility":"list","supported_in_api":false}"#,
+      )
+      .unwrap();
+      assert!(!model.listed());
+   }
 }
 
 #[cfg(test)]
