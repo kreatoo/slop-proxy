@@ -21,6 +21,7 @@ use crate::config::{
 use crate::db::Db;
 use crate::db::accounts::NewAccount;
 use crate::db::tokens::TokenLimits;
+use crate::db::quota::QuotaObservation;
 use crate::db::usage::UsageDim;
 use crate::oauth::TokenSet;
 use crate::pool::Pools;
@@ -232,6 +233,46 @@ async fn anthropic_streaming_end_to_end() {
    assert_eq!(totals.cache_read_tokens, 20);
    assert_eq!(totals.output_tokens, 25);
    assert_eq!(totals.reasoning_tokens, 5);
+}
+
+#[tokio::test]
+async fn usage_endpoint_reports_authenticated_fleet_budget() {
+   let (base, db) = spawn_proxy().await;
+   let account_id = db.list_accounts().await.unwrap()[0].id;
+   db.set_user_fleet_quota_budgets("alice", None, Some(50.0))
+      .await
+      .unwrap();
+   let observed_at = clock::unix_now();
+   db.observe_quota(QuotaObservation {
+      account_id,
+      window_seconds: 604_800,
+      resets_at: observed_at + 3600,
+      used_percent: 10.0,
+      observed_at,
+   })
+   .await
+   .unwrap();
+
+   let response = reqwest::Client::new()
+      .get(format!("{base}/v1/usage"))
+      .bearer_auth("sp-test")
+      .send()
+      .await
+      .unwrap();
+   assert_eq!(response.status(), 200);
+   let value = response.json::<serde_json::Value>().await.unwrap();
+   assert_eq!(value["user"], "alice");
+   assert_eq!(value["fleet"]["plan_weights"]["plus"], 1.0);
+   assert_eq!(value["fleet"]["plan_weights"]["prolite"], 5.0);
+   assert_eq!(value["fleet"]["plan_weights"]["pro"], 20.0);
+   assert_eq!(value["fleet"]["personal_accounts_excluded"], true);
+   let window = &value["fleet"]["windows"][0];
+   assert_eq!(window["window_seconds"], 604800);
+   assert_eq!(window["budget_percent"], 50.0);
+   assert_eq!(window["weighted_capacity_points"], 90.0);
+   assert_eq!(window["weighted_allowance_points"], 45.0);
+   assert_eq!(window["weighted_used_points"], 0.0);
+   assert_eq!(window["weighted_remaining_points"], 45.0);
 }
 
 #[tokio::test]

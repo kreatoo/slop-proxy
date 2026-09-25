@@ -11,6 +11,7 @@ pub mod pipeline;
 pub mod relay;
 #[cfg(test)]
 mod tests;
+pub mod usage;
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -164,6 +165,7 @@ pub fn router(state: AppState) -> Router {
       .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
       .route("/v1/chat/completions", post(openai::chat_completions))
       .route("/v1/models", get(openai::models))
+      .route("/v1/usage", get(usage::usage))
       .route("/v1beta/models", get(gemini::models))
       .route("/v1beta/models/{spec}", post(gemini::native))
       .route("/config/codex/auth.json", get(clientcfg::codex_auth))
