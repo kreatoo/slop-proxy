@@ -1230,6 +1230,15 @@ mod tests {
       db.set_user_quota_budget("alice", id, 18000, Some(10.0))
          .await
          .unwrap();
+      db.enqueue_usage(UsageRecord {
+         account_id: Some(id),
+         user: "alice".into(),
+         provider: Some(Provider::OpenAi),
+         status: 200,
+         ..Default::default()
+      })
+      .unwrap();
+      db.flush().await.unwrap();
       assert_eq!(db.remove_account(&id.to_string()).await.unwrap(), 1);
       db.call(move |conn| {
          for table in [
@@ -1244,6 +1253,12 @@ mod tests {
                })?;
             assert_eq!(count, 0);
          }
+         let detached: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM usage_log WHERE account_id IS NULL AND user = 'alice'",
+            [],
+            |row| row.get(0),
+         )?;
+         assert_eq!(detached, 1);
          Ok(())
       })
       .await

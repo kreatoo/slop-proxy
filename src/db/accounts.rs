@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use eyre::Result;
-use rusqlite::{OptionalExtension as _, Row, params, types::FromSqlError};
+use rusqlite::{OptionalExtension as _, Row, TransactionBehavior, params, types::FromSqlError};
 
 use super::Db;
 use crate::oauth::TokenSet;
@@ -209,10 +209,22 @@ impl Db {
       self
          .call(move |conn| {
             let id = key.parse::<i64>().unwrap_or(-1);
-            Ok(conn.execute(
+            let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Keep historical usage rows, but detach them from the account so
+            // the account can be removed without violating the foreign key.
+            txn.execute(
+               "UPDATE usage_log SET account_id = NULL
+                WHERE account_id IN (
+                   SELECT id FROM accounts WHERE id = ?1 OR email = ?2 OR label = ?2
+                )",
+               params![id, key],
+            )?;
+            let removed = txn.execute(
                "DELETE FROM accounts WHERE id = ?1 OR email = ?2 OR label = ?2",
                params![id, key],
-            )?)
+            )?;
+            txn.commit()?;
+            Ok(removed)
          })
          .await
    }
