@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
@@ -9,42 +10,60 @@ pub enum Provider {
    Gemini,
    Zen,
    Glm,
+   DeepSeek,
    Experiential,
+   Copilot,
 }
 
 /// `ValueEnum` would derive `open-ai` from the variant name, which is a
 /// spelling no config pattern, database row or `--providers` list accepts.
 impl pound::FromArg for Provider {
-   const POSSIBLE: Option<&'static [&'static str]> =
-      Some(&["openai", "anthropic", "gemini", "zen", "glm"]);
+   const POSSIBLE: Option<&'static [&'static str]> = Some(&Self::NAMES);
 
    fn from_arg(text: &str) -> Result<Self, pound::ValueError> {
-      Self::from_str(text).ok_or_else(|| pound::ValueError::new(text, "unrecognised provider"))
+      text
+         .parse()
+         .map_err(|_| pound::ValueError::new(text, "unrecognised provider"))
    }
 }
 
 impl Provider {
-   pub fn from_str(text: &str) -> Option<Self> {
-      match text.trim() {
-         "openai" => Some(Self::OpenAi),
-         "anthropic" => Some(Self::Anthropic),
-         "gemini" => Some(Self::Gemini),
-         "zen" => Some(Self::Zen),
-         "glm" => Some(Self::Glm),
-         "experiential" => Some(Self::Experiential),
-         _ => None,
-      }
-   }
+   const ALL: [Self; 8] = [
+      Self::OpenAi,
+      Self::Anthropic,
+      Self::Gemini,
+      Self::Zen,
+      Self::Glm,
+      Self::DeepSeek,
+      Self::Experiential,
+      Self::Copilot,
+   ];
+   const NAMES: [&str; 8] = [
+      "openai",
+      "anthropic",
+      "gemini",
+      "zen",
+      "glm",
+      "deepseek",
+      "experiential",
+      "copilot",
+   ];
 
    pub const fn as_str(self) -> &'static str {
-      match self {
-         Self::OpenAi => "openai",
-         Self::Anthropic => "anthropic",
-         Self::Gemini => "gemini",
-         Self::Zen => "zen",
-         Self::Glm => "glm",
-         Self::Experiential => "experiential",
-      }
+      Self::NAMES[self as usize]
+   }
+}
+
+impl FromStr for Provider {
+   type Err = String;
+
+   fn from_str(text: &str) -> Result<Self, Self::Err> {
+      let text = text.trim();
+      Self::NAMES
+         .iter()
+         .position(|name| *name == text)
+         .map(|index| Self::ALL[index])
+         .ok_or_else(|| format!("unknown provider {text:?}"))
    }
 }
 
@@ -79,13 +98,11 @@ impl fmt::Display for AuthMode {
 
 impl FromSql for AuthMode {
    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-      match value.as_str()? {
-         "oauth" => Ok(Self::OAuth),
-         "api_key" => Ok(Self::ApiKey),
-         other => Err(FromSqlError::Other(
-            format!("unknown auth mode {other:?}").into(),
-         )),
-      }
+      let text = value.as_str()?;
+      [Self::OAuth, Self::ApiKey]
+         .into_iter()
+         .find(|mode| mode.as_str() == text)
+         .ok_or_else(|| FromSqlError::Other(format!("unknown auth mode {text:?}").into()))
    }
 }
 
@@ -103,19 +120,10 @@ impl fmt::Display for Provider {
 
 impl FromSql for Provider {
    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-      match value.as_str()? {
-         // "codex" is the name this column used before the rename, and a
-         // db written by the older binary outlives the deploy.
-         "openai" | "codex" => Ok(Self::OpenAi),
-         "anthropic" => Ok(Self::Anthropic),
-         "gemini" => Ok(Self::Gemini),
-         "zen" => Ok(Self::Zen),
-         "glm" => Ok(Self::Glm),
-         "experiential" => Ok(Self::Experiential),
-         other => Err(FromSqlError::Other(
-            format!("unknown provider {other:?}").into(),
-         )),
-      }
+      value
+         .as_str()?
+         .parse()
+         .map_err(|err: String| FromSqlError::Other(err.into()))
    }
 }
 

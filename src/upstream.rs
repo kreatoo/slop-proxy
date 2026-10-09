@@ -1,4 +1,9 @@
+use std::mem;
+
+use axum::http::Response;
 use reqwest::header::HeaderMap;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::clock;
@@ -12,6 +17,11 @@ pub enum SendError {
       retry_after: Option<i64>,
       body: String,
    },
+   #[error("upstream rate limited this model")]
+   ModelLimited {
+      retry_after: Option<i64>,
+      body: String,
+   },
    #[error("upstream error {status}: {body}")]
    Upstream { status: u16, body: String },
    #[error("bad request upstream: {0}")]
@@ -20,9 +30,24 @@ pub enum SendError {
    Network(String),
 }
 
-/// Seconds until the caller may retry, from `retry-after` or the first of the
-/// backend-specific reset headers that parses.
-pub fn retry_after_secs(headers: &HeaderMap, reset_headers: &[&str]) -> Option<i64> {
+impl From<reqwest::Error> for SendError {
+   fn from(err: reqwest::Error) -> Self {
+      Self::Network(err.to_string())
+   }
+}
+
+/// The `{"data": [{"id": ..}]}` listing shape several providers share.
+#[derive(Deserialize)]
+pub struct IdList {
+   pub data: Vec<IdEntry>,
+}
+
+#[derive(Deserialize)]
+pub struct IdEntry {
+   pub id: String,
+}
+
+fn retry_after_secs(headers: &HeaderMap, reset_headers: &[&str]) -> Option<i64> {
    let get = |name: &str| headers.get(name)?.to_str().ok();
    if let Some(retry) = get("retry-after").and_then(|value| value.parse::<i64>().ok()) {
       return Some(retry);
@@ -38,8 +63,7 @@ pub fn retry_after_secs(headers: &HeaderMap, reset_headers: &[&str]) -> Option<i
    Some(if secs > now { secs - now } else { secs }.max(1))
 }
 
-/// How one backend's statuses read. Every client used to spell this out
-/// by hand and they only ever differed in these three fields.
+/// How one backend's statuses read.
 #[derive(Clone, Copy)]
 pub struct Classify {
    /// Non-2xx statuses handed back as a response, for a relay that wants
@@ -47,27 +71,71 @@ pub struct Classify {
    pub pass: fn(u16) -> bool,
    pub auth: &'static [u16],
    pub reset_headers: &'static [&'static str],
+   /// Substrings of a 400 body that say this account cannot serve anyone,
+   /// so it is benched like a rate limit instead of failing the caller.
+   pub account_faults: &'static [&'static str],
+   /// Substrings of a 400 or 429 body that say the key itself is dead, so
+   /// no retry on another account makes it work.
+   pub dead_key: &'static [&'static str],
 }
+
+/// A fault like an empty balance ends when a human acts, which no header
+/// predicts, so the account is re-probed on this schedule until it serves.
+const ACCOUNT_FAULT_RETRY_SECS: i64 = 3600;
 
 impl Classify {
    pub const STRICT: Self = Self {
       pass: |_| false,
       auth: &[401, 403],
       reset_headers: &[],
+      account_faults: &[],
+      dead_key: &[],
    };
 }
 
 pub async fn classify(
-   resp: reqwest::Response,
+   mut resp: reqwest::Response,
    rules: Classify,
 ) -> Result<reqwest::Response, SendError> {
    let status = resp.status().as_u16();
-   if resp.status().is_success() || (rules.pass)(status) {
+   let passed = (rules.pass)(status);
+   let inspect = matches!(status, 400 | 429)
+      && !(rules.account_faults.is_empty() && rules.dead_key.is_empty());
+   if resp.status().is_success() || (passed && !inspect) {
       return Ok(resp);
    }
+
    let retry_after = retry_after_secs(resp.headers(), rules.reset_headers);
-   let body = resp.text().await.unwrap_or_default();
-   let body = body.chars().take(2000).collect::<String>();
+   let status_code = resp.status();
+   let headers = resp.headers().clone();
+   let extensions = mem::take(resp.extensions_mut());
+   let bytes = resp.bytes().await.unwrap_or_default();
+   let body = String::from_utf8_lossy(&bytes)
+      .chars()
+      .take(2000)
+      .collect::<String>();
+   if inspect && rules.dead_key.iter().any(|dead| body.contains(dead)) {
+      return Err(SendError::Auth(body));
+   }
+   if status == 400
+      && rules
+         .account_faults
+         .iter()
+         .any(|fault| body.contains(fault))
+   {
+      return Err(SendError::RateLimited {
+         retry_after: Some(ACCOUNT_FAULT_RETRY_SECS),
+         body,
+      });
+   }
+   if passed {
+      let mut rebuilt = Response::new(bytes);
+      *rebuilt.status_mut() = status_code;
+      *rebuilt.headers_mut() = headers;
+      *rebuilt.extensions_mut() = extensions;
+      return Ok(rebuilt.into());
+   }
+
    Err(if rules.auth.contains(&status) {
       SendError::Auth(body)
    } else {
@@ -80,10 +148,22 @@ pub async fn classify(
    })
 }
 
+pub async fn json<T>(resp: reqwest::Response, rules: Classify) -> Result<T, SendError>
+where
+   T: DeserializeOwned,
+{
+   let resp = classify(resp, rules).await?;
+   let status = resp.status().as_u16();
+   let path = resp.url().path().to_owned();
+   resp.json().await.map_err(|err| SendError::Upstream {
+      status,
+      body: format!("parsing {path}: {err}"),
+   })
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;
-   use axum::http::Response;
 
    fn response(status: u16, body: &'static str) -> reqwest::Response {
       Response::builder()

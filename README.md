@@ -7,22 +7,21 @@ per-user API tokens, and track token usage.
 
 Requests for `claude-*` models (configurable via `models.anthropic_patterns`)
 are relayed verbatim to the Anthropic API over the pooled Max accounts, sticky
-per session so prompt caches keep hitting. Everything else is translated to
-the Codex backend. Log in to Max accounts with
+per session so prompt caches keep hitting. Everything else is translated to the
+Codex backend. Log in to Max accounts with
 `slop-proxy login --provider anthropic`.
 
 Endpoints: `POST /v1/messages`, `POST /v1/chat/completions`, `GET /v1/models`,
-`POST /v1/responses` — streaming, tools, images, and reasoning. Requested model
-names pass through to the backend as-is; use `slop-proxy models` for the real slugs.
-OpenAI latency variants using the generic `-fast` suffix are also accepted when
-an account catalog advertises their base model, such as `gpt-6-astra-fast` when
-`gpt-6-astra` is available.
+`POST /v1/responses`: streaming, tools, images, and reasoning. Requested model
+names pass through to the backend as-is; use `slop-proxy models` for the real
+slugs. OpenAI latency variants using the generic `-fast` suffix are also
+accepted when an account catalog advertises their base model.
 
 ## NixOS module
 
 ```nix
 {
-  inputs.slop-proxy.url = "github:koss/slop-proxy";
+  inputs.slop-proxy.url = "github:amaanq/slop-proxy";
 
   outputs = { nixpkgs, slop-proxy, ... }: {
     nixosConfigurations.host = nixpkgs.lib.nixosSystem {
@@ -87,6 +86,41 @@ This integration supports `/v1/messages` only. Experiential models are not
 served over `/v1/responses` or `/v1/chat/completions`. Existing provider routes
 stay unchanged until you configure `experiential_patterns`.
 
+## Anthropic API keys
+
+Store a paid key with `accounts add-key --provider anthropic`. Reserving it
+keeps it out of the shared pool, so pooled Max seats never serve it and it
+never serves them. Only a token minted with `--reserved-only` can reach it.
+
+```sh
+slop-proxy accounts add-key --provider anthropic --key "$ANTHROPIC_API_KEY"
+slop-proxy accounts reserve <account>
+slop-proxy token create --user alice --reserved-only
+```
+
+## GitHub Copilot accounts
+
+Log in with the same device flow VS Code uses, then opt models into the
+Copilot chat-completions endpoint.
+
+```sh
+slop-proxy login --provider copilot
+```
+
+Then you can configure the models:
+
+```toml
+[models]
+copilot_patterns = ["gpt-5-*"]
+```
+
+The GitHub token is stored as the account's grant and short-lived Copilot tokens
+are minted from it on demand. Usage is read from the terminal usage chunk, so
+streaming and non-streaming calls bill input plus output tokens. This
+integration supports `/v1/chat/completions` only. Copilot models are not served
+over `/v1/responses` or `/v1/messages`. Business and enterprise seats use their
+own host via `copilot.account_type`.
+
 ## Zen egress proxies
 
 Set `zen.proxy_urls` to send only OpenCode Zen traffic through HTTP proxies.
@@ -103,8 +137,8 @@ proxy_urls = [
 ```
 
 `zen.proxy_urls_file` reads one URL per line and may be combined with the inline
-list. Use the file setting when URLs contain credentials that should stay out
-of the config and the Nix store. Configuring either list disables direct Zen
+list. Use the file setting when URLs contain credentials that should stay out of
+the config and the Nix store. Configuring either list disables direct Zen
 egress.
 
 ## Per-token limits and metering

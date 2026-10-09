@@ -3,6 +3,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   provider            TEXT    NOT NULL,
   provider_account_id TEXT    NOT NULL,
   trusted             INTEGER NOT NULL DEFAULT 0,
+  reserved            INTEGER NOT NULL DEFAULT 0,
+  egress              INTEGER NOT NULL DEFAULT 0,
   auth_mode           TEXT    NOT NULL DEFAULT 'oauth',
   email               TEXT,
   label               TEXT,
@@ -10,6 +12,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   access_token        TEXT    NOT NULL,
   refresh_token       TEXT    NOT NULL,
   http_referer        TEXT,
+  turn_state          TEXT,
   access_expires_at   INTEGER,
   last_refresh_at     INTEGER,
   status              TEXT    NOT NULL DEFAULT 'active',
@@ -32,6 +35,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   window_seconds INTEGER NOT NULL DEFAULT 3600,
   slowdown_ms    INTEGER NOT NULL DEFAULT 0,
   prefer_trusted INTEGER NOT NULL DEFAULT 0,
+  reserved_only  INTEGER NOT NULL DEFAULT 0,
   allowed_providers TEXT NOT NULL DEFAULT '',
   created_at     INTEGER NOT NULL DEFAULT (unixepoch()),
   revoked_at     INTEGER
@@ -77,7 +81,8 @@ CREATE TABLE IF NOT EXISTS usage_log (
   request_bytes     INTEGER NOT NULL DEFAULT 0,
   response_bytes    INTEGER NOT NULL DEFAULT 0,
   ttft_ms           INTEGER,
-  stop_reason       TEXT    NOT NULL DEFAULT ''
+  stop_reason       TEXT    NOT NULL DEFAULT '',
+  attempts          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_ts         ON usage_log(ts);

@@ -1,36 +1,44 @@
 use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
-
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse as _, Response};
 use axum::{Extension, Json};
 use eventsource_stream::Eventsource as _;
-use futures_util::StreamExt as _;
-use serde_json::Value;
+use futures_util::{StreamExt as _, stream};
+use serde::Deserialize;
 use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 
-use super::auth::AuthInfo;
-use super::error::{Dialect, translation_error};
-use super::pipeline::{self, apply_snapshot, dispatch_failed, translated};
-use super::{AppState, LogGuard, cache_key, log_error, log_rejected, log_usage};
-use crate::clock::unix_now;
+use crate::anthropic::{Catalog, Model};
+use crate::clock::{rfc3339, unix_now};
 use crate::codex::models::with_zen_entries;
-use crate::codex::types::{OutputItem, ResponseObj, ResponsesEvent, ResponsesRequest};
+use crate::codex::types::{
+   ContentPart, InputItem, OutputItem, ResponseObj, ResponsesEvent, ResponsesRequest,
+};
+use crate::config::ZenDialect;
 use crate::db::usage::UsageRecord;
-use crate::pool::pools::{Dispatched, Upstream};
-use crate::pool::{PoolError, Route, UsageWindow, window_seconds};
+use crate::egress::egress_of;
+use crate::pool::pools::{Catalogs, Dispatched, Upstream};
+use crate::pool::{Route, UsageWindow, window_seconds};
 use crate::provider::Provider;
+use crate::server::auth::AuthInfo;
+use crate::server::error::{Dialect, error_response, pool_error_response, translation_error};
+use crate::server::facts::RequestFacts;
+use crate::server::pipeline::{self, Reply, apply_snapshot, dispatch_failed, translated};
+use crate::server::{
+   AppState, LogGuard, cache_key, copilot, gemini, log_error, log_rejected, log_usage,
+};
 use crate::translate::chat::ChatRequest;
 use crate::translate::openai_req;
 use crate::translate::openai_stream::{OpenAiStream, render_aggregated};
-use crate::translate::{StopKind, UsageCapture, aggregate, model_map, usable_cap};
+use crate::translate::{Aggregated, UsageCapture, model_map, usable_cap};
+use crate::zen::ZenModel;
 
 pub mod websocket;
 
@@ -55,6 +63,19 @@ pub struct ModelEntry {
    pub input: Vec<String>,
 }
 
+impl ModelEntry {
+   fn new(id: String, owned_by: &'static str, context_length: Option<i64>) -> Self {
+      Self {
+         id,
+         object: "model",
+         created: unix_now(),
+         owned_by,
+         context_length,
+         input: Vec::new(),
+      }
+   }
+}
+
 #[derive(serde::Serialize)]
 pub struct ModelList {
    pub object: &'static str,
@@ -63,30 +84,23 @@ pub struct ModelList {
 
 /// The Gemini pool's chat-capable catalog, shared by `/v1/models` and the
 /// `/v1beta` surface a native-dialect caller discovers from.
-pub async fn gemini_entries(state: &AppState) -> Vec<ModelEntry> {
-   let created = unix_now();
-   state
-      .pools
+pub fn gemini_entries(state: &AppState, catalogs: &Catalogs) -> Vec<ModelEntry> {
+   catalogs
       .gemini
-      .models()
-      .await
-      .into_iter()
-      .filter_map(|model| {
-         state
-            .cfg
-            .models
-            .route(&model.id)
-            .eq(&Provider::Gemini)
-            .then_some(ModelEntry {
-               id: model.id,
-               object: "model",
-               created,
-               owned_by: "google",
-               context_length: model.context_window,
-               input: Vec::new(),
-            })
-      })
+      .iter()
+      .filter(|model| state.cfg.models.route(&model.id) == Provider::Gemini)
+      .map(|model| ModelEntry::new(model.id.clone(), "google", model.context_window))
       .collect()
+}
+
+fn zen_responses_models<'cat>(
+   state: &AppState,
+   catalogs: &'cat Catalogs,
+) -> impl Iterator<Item = &'cat ZenModel> {
+   catalogs.zen.iter().filter(|model| {
+      state.cfg.models.route(&model.id) == Provider::Zen
+         && state.cfg.models.zen_dialect(&model.id) != ZenDialect::Messages
+   })
 }
 
 pub async fn chat_completions(
@@ -103,13 +117,13 @@ pub async fn chat_completions(
          return translation_error(DIALECT, &format!("invalid request: {err}"));
       },
    };
-   let facts = super::facts::RequestFacts::from_chat(&req, &headers);
+   let facts = RequestFacts::from_chat(&req, &headers);
    let resolved = model_map::resolve(&state.cfg.models, &req.model);
-   let provider = state.cfg.models.route(&resolved.model);
-   if !auth.may_use(provider) {
-      log_rejected(&state, &auth, "chat", &req.model);
-      return super::error::out_of_scope(DIALECT, provider);
-   }
+   let provider = match pipeline::admit(&state, &auth, DIALECT, "chat", &req.model, &resolved.model)
+   {
+      Ok(provider) => provider,
+      Err(response) => return *response,
+   };
    match provider {
       Provider::Anthropic => {
          log_rejected(&state, &auth, "chat", &req.model);
@@ -122,66 +136,43 @@ pub async fn chat_completions(
          let model = req.model.clone();
          req.model = resolved.model;
          req.reasoning_effort = req.reasoning_effort.or(resolved.effort);
-         return super::gemini::chat_completions(state, auth, req, model, facts).await;
+         return gemini::chat_completions(state, auth, req, model, facts).await;
       },
-      Provider::Glm | Provider::Experiential => {
+      Provider::Copilot => {
+         let model = req.model.clone();
+         req.model = resolved.model;
+         req.reasoning_effort = req.reasoning_effort.or(resolved.effort);
+         return copilot::chat_completions(state, auth, req, model, facts).await;
+      },
+      Provider::Zen if state.cfg.models.zen_dialect(&resolved.model) != ZenDialect::Messages => {},
+      Provider::OpenAi => {},
+      Provider::Glm | Provider::DeepSeek | Provider::Experiential | Provider::Zen => {
          log_rejected(&state, &auth, "chat", &req.model);
          return translation_error(DIALECT, "this model is served over /v1/messages");
       },
-      Provider::Zen | Provider::OpenAi => {},
    }
-   let mut upstream_req = match openai_req::to_responses(&req, &state.cfg) {
+   let mut upstream = match openai_req::to_responses(&req, &state.cfg) {
       Ok(upstream) => upstream,
       Err(err) => {
          log_rejected(&state, &auth, "chat", &req.model);
          return translation_error(DIALECT, &err.to_string());
       },
    };
-   upstream_req.prompt_cache_key = Some(cache_key(&auth.user, &upstream_req));
+   upstream.prompt_cache_key = Some(cache_key(&auth.user, &upstream));
 
-   let mut record = pipeline::record(
+   let record = pipeline::record(
       &auth,
       "chat",
       provider,
       req.model.clone(),
-      upstream_req.model.clone(),
+      upstream.model.clone(),
       facts,
    );
-   record.effort = upstream_req
-      .reasoning
-      .as_ref()
-      .map(|reasoning| reasoning.effort.clone())
-      .unwrap_or_default();
-
-   let session_key = upstream_req.prompt_cache_key.clone().unwrap_or_default();
-   let route = Route {
-      session_key: &session_key,
-      model: &upstream_req.model,
-      service_tier: upstream_req.service_tier.as_deref(),
-      user: &auth.user,
-      pinned_account: auth.limits.pinned_account,
-      prefer_trusted: auth.limits.prefer_trusted,
-      five_hour_limit: auth.limits.five_hour_limit,
-      weekly_limit: auth.limits.weekly_limit,
-   };
-   let Dispatched {
-      account_id,
-      upstream,
-   } = match state.pools.responses(provider, route, &upstream_req).await {
-      Ok(dispatched) => dispatched,
-      Err(err) => return dispatch_failed(&state, record, DIALECT, err),
-   };
-   record.account_id = account_id;
-   record.session_key = session_key;
-
-   let capture = UsageCapture::default();
-   let events = upstream.events(&upstream_req.model, capture.clone());
-
-   if req.stream.unwrap_or(false) {
-      let mut translator =
-         OpenAiStream::new(req.model.clone(), req.include_usage(), capture.clone());
-      let guard = LogGuard::new(state.clone(), capture, record, started);
-      translated(events, guard, move |event| {
+   let model = req.model.clone();
+   let include_usage = req.include_usage();
+   let stream = move |capture: UsageCapture| {
+      let mut translator = OpenAiStream::new(model, include_usage, capture);
+      move |event: Option<ResponsesEvent>| {
          let (chunks, done) = match event {
             Some(event) => (translator.handle(event), false),
             None => (translator.finalize(), true),
@@ -194,22 +185,14 @@ pub async fn chat_completions(
             out.push(Event::default().data("[DONE]"));
          }
          out
-      })
-   } else {
-      let agg = aggregate(events, &capture).await;
-      let snap = capture.snapshot();
-      apply_snapshot(&mut record, &snap, started);
-      if agg.stop == StopKind::Error {
-         let msg = agg
-            .error_message
-            .unwrap_or_else(|| "upstream failure".into());
-         record.status = 502;
-         log_usage(&state, record);
-         return super::error::error_response(DIALECT, 502, "api_error", &msg);
       }
-      record.error_kind = snap.error_kind;
-      pipeline::logged_json(&state, record, render_aggregated(&agg, &req.model))
-   }
+   };
+   let reply = Reply {
+      dialect: DIALECT,
+      stream: req.stream.unwrap_or(false).then_some(stream),
+      render: |agg: &Aggregated| render_aggregated(agg, &req.model),
+   };
+   pipeline::serve_translated(state, &auth, record, provider, &upstream, started, reply).await
 }
 
 /// Codex opens a WebSocket to this path before falling back to HTTP, and only
@@ -220,6 +203,47 @@ pub fn responses_upgrade_required() -> Response {
       "WebSocket unavailable for this request, use HTTP POST",
    )
       .into_response()
+}
+
+fn messages_catalog(state: &AppState) -> Catalog {
+   let catalogs = state.pools.catalogs();
+   let mut data = catalogs.anthropic.to_vec();
+   let now = rfc3339(unix_now());
+   let synthetic = |id: String| Model {
+      display_name: id.clone(),
+      id,
+      created_at: now.clone(),
+      kind: "model".to_owned(),
+   };
+
+   data.extend(
+      catalogs
+         .glm
+         .iter()
+         .filter(|model| state.cfg.models.route(&model.id) == Provider::Glm)
+         .cloned(),
+   );
+   data.extend(
+      catalogs
+         .deepseek
+         .iter()
+         .filter(|id| state.cfg.models.route(id) == Provider::DeepSeek)
+         .map(|id| synthetic(id.clone())),
+   );
+   data.extend(
+      catalogs
+         .zen
+         .iter()
+         .filter(|model| state.cfg.models.zen_dialect(&model.id) == ZenDialect::Messages)
+         .map(|model| synthetic(model.id.clone())),
+   );
+
+   Catalog {
+      first_id: data.first().map(|model| model.id.clone()),
+      last_id: data.last().map(|model| model.id.clone()),
+      has_more: false,
+      data,
+   }
 }
 
 /// Codex asks with a `client_version` query and reads its context window out
@@ -234,71 +258,45 @@ pub async fn models(
    // understands its own. `anthropic-version` is required on every Anthropic
    // API call, so its presence identifies the caller.
    if headers.contains_key("anthropic-version") {
-      return match state.pools.anthropic.models_raw().await {
-         Ok(body) => ([("content-type", "application/json")], body).into_response(),
-         Err(err) => super::error::error_response(
-            super::error::Dialect::Anthropic,
-            503,
-            "api_error",
-            &format!("reading the model catalog: {err}"),
-         ),
-      };
+      return Json(messages_catalog(&state)).into_response();
    }
+
+   let catalogs = state.pools.catalogs();
    if query.client_version.is_some() {
-      let zen: Vec<String> = state
-         .pools
-         .zen
-         .models()
-         .await
-         .into_iter()
-         .filter(|id| state.cfg.models.route(id) == Provider::Zen)
-         .collect();
       return state
          .catalog(&auth.user, auth.limits.pinned_account)
          .await
          .map_or_else(
             || {
-               super::error::error_response(
+               error_response(
                   DIALECT,
-                  503,
+                  StatusCode::SERVICE_UNAVAILABLE,
                   "api_error",
                   "no usable codex account to read the model catalog from",
                )
             },
             |catalog| {
-               let body = match serde_json::to_string(&catalog) {
-                  Ok(body) => body,
-                  Err(error) => {
-                     return super::error::error_response(
-                        DIALECT,
-                        500,
-                        "api_error",
-                        &format!("serializing model catalog failed {error}"),
-                     );
-                  },
-               };
-               let body = with_zen_entries(&body, &state.cfg.models.default, &zen).unwrap_or(body);
+               let body = serde_json::to_string(&catalog).expect("catalog serializes");
+               let body = with_zen_entries(
+                  &body,
+                  &state.cfg.models.default,
+                  zen_responses_models(&state, &catalogs),
+               )
+               .unwrap_or(body);
                ([("content-type", "application/json")], body).into_response()
             },
          );
    }
 
-   let created = unix_now();
-
    let live = state.catalog(&auth.user, auth.limits.pinned_account).await;
-
    let mut data = if let Some(models) = live {
       models
          .models
          .iter()
          .filter(|model| model.listed())
          .map(|model| ModelEntry {
-            id: model.slug.clone(),
-            object: "model",
-            created,
-            owned_by: "openai",
-            context_length: model.context_window,
             input: model.input_modalities.clone(),
+            ..ModelEntry::new(model.slug.clone(), "openai", model.context_window)
          })
          .collect::<Vec<ModelEntry>>()
    } else {
@@ -308,34 +306,26 @@ pub async fn models(
          ids.push(default.clone());
       }
       ids.into_iter()
-         .map(|id| ModelEntry {
-            id,
-            object: "model",
-            created,
-            owned_by: "slop-proxy",
-            context_length: None,
-            input: Vec::new(),
-         })
+         .map(|id| ModelEntry::new(id, "slop-proxy", None))
          .collect::<Vec<ModelEntry>>()
    };
 
-   data.extend(state.pools.zen.models().await.into_iter().filter_map(|id| {
-      state
-         .cfg
-         .models
-         .route(&id)
-         .eq(&Provider::Zen)
-         .then_some(ModelEntry {
-            id,
-            object: "model",
-            created,
-            owned_by: "opencode",
-            context_length: None,
-            input: Vec::new(),
-         })
-   }));
-
-   data.extend(gemini_entries(&state).await);
+   // This catalog is what an openai-dialect client discovers from, so a zen
+   // model the responses surface refuses must not appear in it.
+   data.extend(
+      zen_responses_models(&state, &catalogs)
+         .map(|model| ModelEntry::new(model.id.clone(), "opencode", model.context_window)),
+   );
+   data.extend(gemini_entries(&state, &catalogs));
+   // The Copilot catalog narrowed to whatever `copilot_patterns` claims, so
+   // `/v1/models` only advertises what this proxy will actually serve.
+   data.extend(
+      catalogs
+         .copilot
+         .iter()
+         .filter(|id| state.cfg.models.route(id) == Provider::Copilot)
+         .map(|id| ModelEntry::new(id.clone(), "github", None)),
+   );
 
    Json(ModelList {
       object: "list",
@@ -375,40 +365,11 @@ struct ReasoningPatch {
    rest: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Default)]
-struct ZenFixups {
-   hoisted: usize,
-   rewritten: usize,
-   dropped: usize,
-   unpaired: usize,
-   repaired: usize,
-   malformed: usize,
-}
-
-#[derive(serde::Serialize)]
-struct AssistantText {
-   #[serde(rename = "type")]
-   kind: &'static str,
-   role: &'static str,
-   content: [TextPart; 1],
-}
-
-#[derive(serde::Serialize)]
-struct TextPart {
-   #[serde(rename = "type")]
-   kind: &'static str,
-   text: String,
-}
-
 /// Zen 400s any `max_output_tokens` under 16, and no other provider wants it either.
-fn drop_unusable_max_output_tokens(rest: &mut serde_json::Map<String, Value>, user: &str) {
-   let Some(value) = rest.get("max_output_tokens") else {
-      return;
-   };
-   let Some(cap) = value.as_u64() else {
-      return;
-   };
-   if usable_cap(Some(cap)).is_none() {
+fn drop_unusable_max_output_tokens(rest: &mut Map<String, Value>, user: &str) {
+   if let Some(cap) = rest.get("max_output_tokens").and_then(Value::as_u64)
+      && usable_cap(Some(cap)).is_none()
+   {
       tracing::debug!(cap, user = %user, "dropped a max_output_tokens below the upstream floor");
       rest.remove("max_output_tokens");
    }
@@ -416,23 +377,29 @@ fn drop_unusable_max_output_tokens(rest: &mut serde_json::Map<String, Value>, us
 
 const ENCRYPTED_PAYLOAD_NOTE: &str = "[this payload was encrypted by OpenAI before it reached the proxy and cannot be read here. The parent session has to send its requests through the proxy as well.]";
 
+fn input_items(rest: &mut Map<String, Value>) -> Option<&mut Vec<Value>> {
+   rest.get_mut("input").and_then(Value::as_array_mut)
+}
+
+fn for_each_tool_list(rest: &mut Map<String, Value>, mut each: impl FnMut(&mut [Value])) {
+   if let Some(&mut Value::Array(ref mut tools)) = rest.get_mut("tools") {
+      each(tools);
+   }
+   for item in input_items(rest).into_iter().flatten() {
+      if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+         && let Some(&mut Value::Array(ref mut tools)) = item.get_mut("tools")
+      {
+         each(tools);
+      }
+   }
+}
+
 /// The backend returns any argument whose schema says `encrypted: true` as a Fernet
 /// token only its own backend can read, which is how a spawned agent on
 /// another provider ends up with the header of a task and no payload.
-fn strip_encrypted_argument_flags(rest: &mut serde_json::Map<String, Value>) -> usize {
+fn strip_encrypted_argument_flags(rest: &mut Map<String, Value>) -> usize {
    let mut stripped = 0;
-   if let Some(&mut Value::Array(ref mut tools)) = rest.get_mut("tools") {
-      stripped += strip_encrypted_from_tools(tools);
-   }
-   if let Some(&mut Value::Array(ref mut items)) = rest.get_mut("input") {
-      for item in items.iter_mut() {
-         if item.get("type").and_then(Value::as_str) == Some("additional_tools")
-            && let Some(&mut Value::Array(ref mut tools)) = item.get_mut("tools")
-         {
-            stripped += strip_encrypted_from_tools(tools);
-         }
-      }
-   }
+   for_each_tool_list(rest, |tools| stripped += strip_encrypted_from_tools(tools));
    stripped
 }
 
@@ -483,35 +450,19 @@ fn rename_tools(tools: &mut [Value]) -> usize {
    renamed
 }
 
-fn rename_reserved_namespace(rest: &mut serde_json::Map<String, Value>) -> usize {
+fn rename_reserved_namespace(rest: &mut Map<String, Value>) -> usize {
    let mut renamed = 0;
-   if let Some(&mut Value::Array(ref mut tools)) = rest.get_mut("tools") {
-      renamed += rename_tools(tools);
-   }
-   let Some(&mut Value::Array(ref mut items)) = rest.get_mut("input") else {
-      return renamed;
-   };
+   for_each_tool_list(rest, |tools| renamed += rename_tools(tools));
    let mention = format!("functions.{RESERVED_NAMESPACE}.");
    let replacement = format!("functions.{PROXY_NAMESPACE}.");
-   for item in items.iter_mut() {
+   for item in input_items(rest).into_iter().flatten() {
       let reserved_call = item.get("namespace").and_then(Value::as_str) == Some(RESERVED_NAMESPACE);
       if reserved_call && let Some(item) = item.as_object_mut() {
          item.insert("namespace".into(), Value::String(PROXY_NAMESPACE.into()));
          renamed += 1;
          continue;
       }
-      let kind = item
-         .get("type")
-         .and_then(Value::as_str)
-         .unwrap_or_default()
-         .to_owned();
-      if kind == "additional_tools"
-         && let Some(&mut Value::Array(ref mut tools)) = item.get_mut("tools")
-      {
-         renamed += rename_tools(tools);
-         continue;
-      }
-      if kind == "message"
+      if item.get("type").and_then(Value::as_str) == Some("message")
          && item.get("role").and_then(Value::as_str) == Some("developer")
          && let Some(&mut Value::Array(ref mut parts)) = item.get_mut("content")
       {
@@ -543,36 +494,6 @@ fn restore_reserved_namespace(data: String) -> String {
    }
 }
 
-/// Item type, author and the first characters of every `encrypted_content`
-/// left in the request after unwrapping, for reading a decrypt failure.
-fn opaque_payloads(rest: &serde_json::Map<String, Value>) -> Vec<String> {
-   let Some(items) = rest.get("input").and_then(Value::as_array) else {
-      return Vec::new();
-   };
-   let mut found = Vec::new();
-   for item in items {
-      let kind = item.get("type").and_then(Value::as_str).unwrap_or("?");
-      if kind == "reasoning" {
-         continue;
-      }
-      let parts = item
-         .get("content")
-         .or_else(|| item.get("output"))
-         .and_then(Value::as_array);
-      let Some(parts) = parts else {
-         continue;
-      };
-      for part in parts {
-         if let Some(text) = part.get("encrypted_content").and_then(Value::as_str) {
-            let head: String = text.chars().take(12).collect();
-            let author = item.get("author").and_then(Value::as_str).unwrap_or("");
-            found.push(format!("{kind}:{author}:{head}"));
-         }
-      }
-   }
-   found
-}
-
 fn is_fernet_token(text: &str) -> bool {
    text.starts_with("gAAAA")
 }
@@ -580,12 +501,9 @@ fn is_fernet_token(text: &str) -> bool {
 /// Codex wraps a plaintext task as `encrypted_content` whenever the backend
 /// omits `encrypted_function_args`, and the backend 400s that with
 /// `invalid_encrypted_content`.
-fn unwrap_plaintext_agent_payloads(rest: &mut serde_json::Map<String, Value>) -> usize {
-   let Some(&mut Value::Array(ref mut items)) = rest.get_mut("input") else {
-      return 0;
-   };
+fn unwrap_plaintext_agent_payloads(rest: &mut Map<String, Value>) -> usize {
    let mut unwrapped = 0;
-   for item in items.iter_mut() {
+   for item in input_items(rest).into_iter().flatten() {
       if item.get("type").and_then(Value::as_str) != Some("agent_message") {
          continue;
       }
@@ -599,8 +517,7 @@ fn unwrap_plaintext_agent_payloads(rest: &mut serde_json::Map<String, Value>) ->
          if is_fernet_token(text) {
             continue;
          }
-         *part = serde_json::to_value(TextPart {
-            kind: "input_text",
+         *part = serde_json::to_value(ContentPart::InputText {
             text: text.to_owned(),
          })
          .unwrap_or(Value::Null);
@@ -610,12 +527,12 @@ fn unwrap_plaintext_agent_payloads(rest: &mut serde_json::Map<String, Value>) ->
    unwrapped
 }
 
-fn drop_composite_reasoning(rest: &mut serde_json::Map<String, Value>) -> usize {
+fn drop_composite_reasoning(rest: &mut Map<String, Value>) -> usize {
    let valid = |id: &str| {
       id.bytes()
          .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
    };
-   let Some(&mut Value::Array(ref mut items)) = rest.get_mut("input") else {
+   let Some(items) = input_items(rest) else {
       return 0;
    };
    let before = items.len();
@@ -627,18 +544,15 @@ fn drop_composite_reasoning(rest: &mut serde_json::Map<String, Value>) -> usize 
 }
 
 /// Zen 400s these codex-only items as `input[N] did not match any supported type`.
-fn zen_input_fixups(rest: &mut serde_json::Map<String, Value>) -> ZenFixups {
-   let mut fixes = ZenFixups::default();
+fn zen_input_fixups(rest: &mut Map<String, Value>, user: &str) {
+   let mut rewritten = 0;
+   let mut dropped = 0;
    let mut hoisted = Vec::new();
-   if let Some(&mut Value::Array(ref mut items)) = rest.get_mut("input") {
+   if let Some(items) = input_items(rest) {
       let before = items.len();
       for item in items.iter_mut() {
-         let kind = item
-            .get("type")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_default();
-         match kind.as_str() {
+         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+         match kind {
             "additional_tools" => {
                if let Some(&mut Value::Array(ref mut tools)) = item.get_mut("tools") {
                   hoisted.append(tools);
@@ -665,14 +579,10 @@ fn zen_input_fixups(rest: &mut serde_json::Map<String, Value>) -> ZenFixups {
                *item = if text.is_empty() {
                   Value::Null
                } else {
-                  fixes.rewritten += 1;
-                  serde_json::to_value(AssistantText {
-                     kind: "message",
-                     role: "assistant",
-                     content: [TextPart {
-                        kind: "output_text",
-                        text,
-                     }],
+                  rewritten += 1;
+                  serde_json::to_value(InputItem::Message {
+                     role: "assistant".into(),
+                     content: vec![ContentPart::OutputText { text }],
                   })
                   .unwrap_or(Value::Null)
                };
@@ -683,10 +593,10 @@ fn zen_input_fixups(rest: &mut serde_json::Map<String, Value>) -> ZenFixups {
          }
       }
       items.retain(|item| !item.is_null());
-      fixes.dropped = before - items.len();
+      dropped = before - items.len();
    }
+   let hoisted_count = hoisted.len();
    if !hoisted.is_empty() {
-      fixes.hoisted = hoisted.len();
       match rest.get_mut("tools") {
          Some(&mut Value::Array(ref mut tools)) => tools.append(&mut hoisted),
          _ => {
@@ -694,15 +604,26 @@ fn zen_input_fixups(rest: &mut serde_json::Map<String, Value>) -> ZenFixups {
          },
       }
    }
-   (fixes.repaired, fixes.malformed) = repair_tool_arguments(rest);
-   fixes.unpaired = drop_unpaired_tool_items(rest);
-   fixes
+   let (repaired, malformed) = repair_tool_arguments(rest);
+   let unpaired = drop_unpaired_tool_items(rest);
+   if hoisted_count + rewritten + dropped + unpaired + repaired + malformed > 0 {
+      tracing::warn!(
+         hoisted = hoisted_count,
+         rewritten,
+         dropped,
+         unpaired,
+         repaired,
+         malformed,
+         user = %user,
+         "reshaped codex-only input items for zen"
+      );
+   }
 }
 
 /// Zen 400s `param: "arguments"` on a call whose arguments are not JSON, and
 /// an empty string is not.
-fn repair_tool_arguments(rest: &mut serde_json::Map<String, Value>) -> (usize, usize) {
-   let Some(&mut Value::Array(ref mut items)) = rest.get_mut("input") else {
+fn repair_tool_arguments(rest: &mut Map<String, Value>) -> (usize, usize) {
+   let Some(items) = input_items(rest) else {
       return (0, 0);
    };
    let mut repaired = 0;
@@ -733,13 +654,10 @@ fn repair_tool_arguments(rest: &mut serde_json::Map<String, Value>) -> (usize, u
 }
 
 /// An unpaired `*_call` or `*_call_output` is a 400 on zen.
-fn drop_unpaired_tool_items(rest: &mut serde_json::Map<String, Value>) -> usize {
-   let Some(&mut Value::Array(ref mut items)) = rest.get_mut("input") else {
-      return 0;
-   };
-   let side = |item: &Value| -> Option<(bool, String)> {
+fn drop_unpaired_tool_items(rest: &mut Map<String, Value>) -> usize {
+   fn side(item: &Value) -> Option<(bool, &str)> {
       let kind = item.get("type")?.as_str()?;
-      let call_id = item.get("call_id")?.as_str()?.to_owned();
+      let call_id = item.get("call_id")?.as_str()?;
       if kind.ends_with("_call_output") {
          Some((false, call_id))
       } else if kind.ends_with("_call") {
@@ -747,47 +665,29 @@ fn drop_unpaired_tool_items(rest: &mut serde_json::Map<String, Value>) -> usize 
       } else {
          None
       }
+   }
+
+   let Some(items) = input_items(rest) else {
+      return 0;
    };
    let mut calls = HashSet::new();
    let mut outputs = HashSet::new();
    for item in items.iter() {
-      match side(item) {
-         Some((true, call_id)) => calls.insert(call_id),
-         Some((false, call_id)) => outputs.insert(call_id),
-         None => false,
-      };
+      if let Some((is_call, call_id)) = side(item) {
+         if is_call {
+            calls.insert(call_id.to_owned());
+         } else {
+            outputs.insert(call_id.to_owned());
+         }
+      }
    }
    let before = items.len();
    items.retain(|item| match side(item) {
-      Some((true, ref call_id)) => outputs.contains(call_id),
-      Some((false, ref call_id)) => calls.contains(call_id),
+      Some((true, call_id)) => outputs.contains(call_id),
+      Some((false, call_id)) => calls.contains(call_id),
       None => true,
    });
    before - items.len()
-}
-
-fn rejected_index(body: &str) -> Option<usize> {
-   let tail = body.split_once("\"param\":\"input[")?.1;
-   tail.split(']').next()?.parse().ok()
-}
-
-fn note_rejected_item(body: &str, rest: &serde_json::Map<String, Value>) {
-   let Some(index) = rejected_index(body) else {
-      return;
-   };
-   let Some(item) = rest
-      .get("input")
-      .and_then(Value::as_array)
-      .and_then(|items| items.get(index))
-   else {
-      return;
-   };
-   let kind = item.get("type").and_then(Value::as_str).unwrap_or("?");
-   let keys: Vec<&str> = item
-      .as_object()
-      .map(|fields| fields.keys().map(String::as_str).collect())
-      .unwrap_or_default();
-   tracing::warn!(index, kind, ?keys, "zen rejected an input item");
 }
 
 fn prepare_request(
@@ -801,18 +701,28 @@ fn prepare_request(
    let resolved = model_map::resolve(&state.cfg.models, &requested_model);
    // Scope is decided by where the model resolves, not by the endpoint. This
    // surface is the Responses API, which zen speaks as well as codex does.
-   let provider = state.cfg.models.route(&resolved.model);
-   if !matches!(
-      provider,
-      Provider::OpenAi | Provider::Zen | Provider::Gemini
-   ) {
+   let provider = pipeline::admit(
+      state,
+      auth,
+      DIALECT,
+      "responses",
+      &requested_model,
+      &resolved.model,
+   )?;
+   let responses_native = match provider {
+      Provider::OpenAi | Provider::Gemini => true,
+      Provider::Zen => state.cfg.models.zen_dialect(&resolved.model) != ZenDialect::Messages,
+      Provider::Anthropic
+      | Provider::Glm
+      | Provider::DeepSeek
+      | Provider::Experiential
+      | Provider::Copilot => false,
+   };
+   if !responses_native {
       return Err(Box::new(translation_error(
          DIALECT,
          "this model is not served over the responses api",
       )));
-   }
-   if !auth.may_use(provider) {
-      return Err(Box::new(super::error::out_of_scope(DIALECT, provider)));
    }
    req.model = Some(resolved.model.clone());
    if req.service_tier.is_none() {
@@ -833,56 +743,116 @@ fn prepare_request(
    // on another backend receives ciphertext it cannot read. Reserved functions
    // are skipped per tool in strip_encrypted_from_tools instead.
    let renamed = if provider == Provider::OpenAi {
+      req.instructions
+         .get_or_insert_with(|| state.cfg.codex.instructions());
+      let dropped_reasoning = drop_composite_reasoning(&mut req.rest);
+      if dropped_reasoning > 0 {
+         let user = &auth.user;
+         tracing::debug!(dropped_reasoning, %user, "dropped reasoning from another backend");
+      }
       rename_reserved_namespace(&mut req.rest)
    } else {
       0
    };
    let flags = strip_encrypted_argument_flags(&mut req.rest);
    let payloads = unwrap_plaintext_agent_payloads(&mut req.rest);
-   let dropped_reasoning = if provider == Provider::OpenAi {
-      drop_composite_reasoning(&mut req.rest)
-   } else {
-      0
-   };
-   let opaque = opaque_payloads(&req.rest);
-   if !opaque.is_empty() {
-      tracing::info!(?opaque, user = %auth.user, "request still carries encrypted payloads");
-   }
    if renamed + flags + payloads > 0 {
       tracing::debug!(renamed, flags, payloads, user = %auth.user, "kept inter-agent payloads readable");
    }
-   if dropped_reasoning > 0 {
-      tracing::debug!(dropped_reasoning, user = %auth.user, "dropped reasoning from another backend");
-   }
-
    if provider == Provider::Zen {
-      let fixes = zen_input_fixups(&mut req.rest);
-      if fixes.hoisted
-         + fixes.rewritten
-         + fixes.dropped
-         + fixes.unpaired
-         + fixes.repaired
-         + fixes.malformed
-         > 0
-      {
-         tracing::warn!(
-            fixes.hoisted,
-            fixes.rewritten,
-            fixes.dropped,
-            fixes.unpaired,
-            fixes.repaired,
-            fixes.malformed,
-            user = %auth.user,
-            "reshaped codex-only input items for zen"
-         );
-      }
+      zen_input_fixups(&mut req.rest, &auth.user);
    }
-
    req.store = Some(false);
-   if req.instructions.is_none() && provider == Provider::OpenAi {
-      req.instructions = Some(state.cfg.codex.instructions());
-   }
    Ok((req, requested_model, provider))
+}
+
+#[derive(Deserialize)]
+struct SearchPeek {
+   id: Option<String>,
+   model: String,
+}
+
+/// Codex's web search tool posts here instead of `/responses`, and
+/// only the codex backend serves it, whatever model the turn runs on.
+pub async fn search(
+   State(state): State<AppState>,
+   Extension(auth): Extension<AuthInfo>,
+   headers: HeaderMap,
+   body: Bytes,
+) -> Response {
+   let peek = match serde_json::from_slice::<SearchPeek>(&body) {
+      Ok(peek) => peek,
+      Err(err) => return translation_error(DIALECT, &format!("invalid request: {err}")),
+   };
+   let session_key = peek.id.unwrap_or_else(|| auth.user.clone());
+   let route = auth.route(&session_key, &peek.model);
+   let served = match state.pools.codex.search(route, body, headers).await {
+      Ok(served) => served,
+      Err(err) => return pool_error_response(DIALECT, &state.cfg.models, err),
+   };
+   relay_json(served.response).await
+}
+
+/// Reads from the codex backend whose answer is the same for every account.
+pub async fn backend_get(
+   State(state): State<AppState>,
+   Extension(auth): Extension<AuthInfo>,
+   uri: Uri,
+) -> Response {
+   let Some(path) = uri
+      .path_and_query()
+      .and_then(|path| path.as_str().strip_prefix("/backend-api"))
+   else {
+      return translation_error(DIALECT, "not a backend-api path");
+   };
+   let route = auth.route(&auth.user, "");
+   let served = match state.pools.codex.get(route, path.to_owned()).await {
+      Ok(served) => served,
+      Err(err) => return pool_error_response(DIALECT, &state.cfg.models, err),
+   };
+   relay_json(served.response).await
+}
+
+async fn relay_json(response: reqwest::Response) -> Response {
+   let status = response.status();
+   match response.bytes().await {
+      Ok(bytes) => (status, [(CONTENT_TYPE, "application/json")], bytes).into_response(),
+      Err(err) => error_response(
+         DIALECT,
+         StatusCode::BAD_GATEWAY,
+         "upstream_error",
+         &format!("reading upstream response: {err}"),
+      ),
+   }
+}
+
+fn passthrough_record(
+   auth: &AuthInfo,
+   provider: Provider,
+   requested_model: String,
+   req: &PassthroughRequest,
+   facts: RequestFacts,
+   session_key: &str,
+) -> UsageRecord {
+   let mut record = pipeline::record(
+      auth,
+      "responses",
+      provider,
+      requested_model,
+      req.model.clone().unwrap_or_default(),
+      facts,
+   );
+   record.effort = req
+      .reasoning
+      .as_ref()
+      .and_then(|reasoning| reasoning.effort.clone())
+      .unwrap_or_default();
+   record.service_tier = req.service_tier.clone().unwrap_or_default();
+   record.session_key = req
+      .prompt_cache_key
+      .clone()
+      .unwrap_or_else(|| session_key.to_owned());
+   record
 }
 
 pub async fn responses_passthrough(
@@ -906,10 +876,6 @@ pub async fn responses_passthrough(
       Ok(value) => Bytes::from(value),
       Err(err) => return translation_error(DIALECT, &format!("serializing request: {err}")),
    };
-   let session_key = req
-      .prompt_cache_key
-      .clone()
-      .unwrap_or_else(|| auth.user.clone());
 
    let typed = match serde_json::from_slice::<ResponsesRequest>(&encoded) {
       Ok(typed) => Some(typed),
@@ -920,58 +886,42 @@ pub async fn responses_passthrough(
    };
    let facts = typed
       .as_ref()
-      .map(|typed| super::facts::RequestFacts::from_responses(typed, &headers))
+      .map(|typed| RequestFacts::from_responses(typed, &headers))
       .unwrap_or_default();
-   let mut record = pipeline::record(
-      &auth,
-      "responses",
-      provider,
-      requested_model,
-      req.model.clone().unwrap_or_default(),
-      facts,
-   );
-   record.effort = req
-      .reasoning
-      .as_ref()
-      .and_then(|reasoning| reasoning.effort.clone())
-      .unwrap_or_default();
-   record.service_tier = req.service_tier.clone().unwrap_or_default();
-   record.session_key = session_key.clone();
+   let mut record = passthrough_record(&auth, provider, requested_model, &req, facts, &auth.user);
    let route = Route {
-      session_key: &session_key,
-      model: &record.upstream_model,
       service_tier: req.service_tier.as_deref(),
-      user: &auth.user,
-      pinned_account: auth.limits.pinned_account,
-      prefer_trusted: auth.limits.prefer_trusted,
-      five_hour_limit: auth.limits.five_hour_limit,
-      weekly_limit: auth.limits.weekly_limit,
+      ..auth.route(&record.session_key, &record.upstream_model)
    };
    let Dispatched {
       account_id,
       upstream,
+      attempts,
    } = match state
       .pools
-      .responses_raw(provider, route, encoded, typed.as_ref(), &headers)
+      .responses_raw(
+         &state.cfg.models,
+         provider,
+         route,
+         encoded,
+         typed.as_ref(),
+         &headers,
+      )
       .await
    {
       Ok(dispatched) => dispatched,
-      Err(err) => {
-         if provider == Provider::Zen
-            && let PoolError::BadRequest {
-               body: ref error_body,
-               ..
-            } = err
-         {
-            note_rejected_item(error_body, &req.rest);
-         }
-         return dispatch_failed(&state, record, DIALECT, err);
-      },
+      Err(err) => return dispatch_failed(&state, record, DIALECT, err),
    };
    record.account_id = account_id;
+   record.attempts = i64::from(attempts);
    let capture = UsageCapture::default();
    let resp = match upstream {
-      Upstream::Responses(resp) => resp,
+      Upstream::Responses(resp) => {
+         if let Some(index) = egress_of(&resp) {
+            capture.note_egress(index);
+         }
+         resp
+      },
       bridged @ Upstream::Bridged { .. } => {
          let model = record.upstream_model.clone();
          return bridged_responses(state, record, bridged, model, client_streams, started).await;
@@ -979,26 +929,30 @@ pub async fn responses_passthrough(
    };
 
    if client_streams {
-      let limits = if provider == Provider::OpenAi {
-         rate_limit_headers(
-            &state
-               .pools
-               .codex
-               .pool_windows(&auth.user, auth.limits.pinned_account, None)
-               .await,
-         )
-      } else {
-         Vec::new()
-      };
-      return relay_stream(
-         resp,
-         LogGuard::new(state.clone(), capture.clone(), record, started),
-         capture,
-         limits,
-      );
+      let guard = LogGuard::new(state.clone(), capture.clone(), record, started);
+      let mut response = relay_stream(resp, guard, capture);
+      if provider == Provider::OpenAi {
+         let windows = state
+            .pools
+            .codex
+            .pool_windows(&auth.user, auth.limits.pinned_account, None)
+            .await;
+         rate_limit_headers(&windows, response.headers_mut());
+      }
+      return response;
    }
 
    raw_response(state, record, resp, capture, started).await
+}
+
+fn upstream_eof(state: &AppState, record: UsageRecord) -> Response {
+   log_error(state, record, 502, "upstream_eof");
+   error_response(
+      DIALECT,
+      StatusCode::BAD_GATEWAY,
+      "api_error",
+      "upstream stream ended unexpectedly",
+   )
 }
 
 async fn raw_response(
@@ -1017,17 +971,17 @@ async fn raw_response(
       if let Ok(parsed) = serde_json::from_str::<ResponsesEvent>(&event.data) {
          capture.observe(&parsed);
       }
-      let Ok(TerminalEvent {
+      if let Ok(TerminalEvent {
          kind,
          response: Some(response),
       }) = serde_json::from_str::<TerminalEvent>(&event.data)
-      else {
-         continue;
-      };
-      if !TerminalEvent::is_terminal(&kind) {
-         continue;
+         && matches!(
+            kind.as_str(),
+            "response.completed" | "response.incomplete" | "response.failed"
+         )
+      {
+         final_response = Some(response);
       }
-      final_response = Some(response);
    }
    let snap = capture.snapshot();
    apply_snapshot(&mut record, &snap, started);
@@ -1035,13 +989,7 @@ async fn raw_response(
       .as_ref()
       .map_or(0, |value| value.get().len() as i64);
    let Some(value) = final_response else {
-      log_error(&state, record, 502, "upstream_eof");
-      return super::error::error_response(
-         DIALECT,
-         502,
-         "api_error",
-         "upstream stream ended unexpectedly",
-      );
+      return upstream_eof(&state, record);
    };
    log_usage(&state, record);
    (
@@ -1064,17 +1012,16 @@ async fn bridged_responses(
    let mut events = upstream.events(&model, capture.clone());
 
    if client_streams {
-      let guard = LogGuard::new(state.clone(), capture.clone(), record, started);
-      let stream = events.map(move |event| {
-         let _ = &guard;
+      let guard = LogGuard::new(state, capture.clone(), record, started);
+      return translated(events, guard, move |event| {
+         let Some(event) = event else {
+            return Vec::new();
+         };
          capture.observe(&event);
          let data = serde_json::to_string(&event).unwrap_or_default();
          capture.note_bytes(data.len());
-         Ok::<_, Infallible>(Event::default().event(event.kind()).data(data))
+         vec![Event::default().event(event.kind()).data(data)]
       });
-      return Sse::new(stream)
-         .keep_alive(KeepAlive::default())
-         .into_response();
    }
 
    let mut output = BTreeMap::new();
@@ -1093,13 +1040,7 @@ async fn bridged_responses(
    let snap = capture.snapshot();
    apply_snapshot(&mut record, &snap, started);
    let Some(mut response) = terminal else {
-      log_error(&state, record, 502, "upstream_eof");
-      return super::error::error_response(
-         DIALECT,
-         502,
-         "api_error",
-         "upstream stream ended unexpectedly",
-      );
+      return upstream_eof(&state, record);
    };
    response
       .id
@@ -1135,108 +1076,71 @@ struct TerminalEvent {
    response: Option<Box<RawValue>>,
 }
 
-impl TerminalEvent {
-   fn is_terminal(kind: &str) -> bool {
-      matches!(
-         kind,
-         "response.completed" | "response.incomplete" | "response.failed"
-      )
-   }
-}
-
 /// What codex reads for `/status`.
-fn rate_limit_headers(windows: &[UsageWindow]) -> Vec<(String, String)> {
+fn rate_limit_headers(windows: &[UsageWindow], headers: &mut HeaderMap) {
    let mut sorted: Vec<_> = windows.iter().collect();
    sorted.sort_by_key(|window| window_seconds(&window.name).unwrap_or(i64::MAX));
-   let mut out = Vec::new();
    for (tier, window) in ["primary", "secondary"].iter().zip(sorted) {
       let Some(minutes) = window_seconds(&window.name).map(|secs| secs / 60) else {
          continue;
       };
-      out.push((
-         format!("x-codex-{tier}-window-minutes"),
-         minutes.to_string(),
-      ));
-      out.push((
-         format!("x-codex-{tier}-used-percent"),
-         ((window.utilization * 100.0).round() as i64).to_string(),
-      ));
+      let mut insert = |field: &str, value: i64| {
+         if let Ok(name) = HeaderName::try_from(format!("x-codex-{tier}-{field}")) {
+            headers.insert(name, HeaderValue::from(value));
+         }
+      };
+      insert("window-minutes", minutes);
+      insert("used-percent", (window.utilization * 100.0).round() as i64);
       if let Some(resets_at) = window.resets_at {
-         out.push((format!("x-codex-{tier}-reset-at"), resets_at.to_string()));
+         insert("reset-at", resets_at);
       }
    }
-   out
 }
 
-fn relay_stream(
-   resp: reqwest::Response,
-   guard: LogGuard,
-   capture: UsageCapture,
-   limits: Vec<(String, String)>,
-) -> Response {
-   struct Held<S> {
-      inner: S,
-      capture: UsageCapture,
-      _guard: LogGuard,
-   }
-   impl<S: futures_util::Stream + Unpin> futures_util::Stream for Held<S> {
-      type Item = S::Item;
-      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-         let polled = Pin::new(&mut self.inner).poll_next(cx);
-         // Never reached if the caller went away first.
-         if matches!(polled, Poll::Ready(None)) {
-            self.capture.note_upstream_eof();
+fn relay_stream(resp: reqwest::Response, guard: LogGuard, capture: UsageCapture) -> Response {
+   let eof = capture.clone();
+   // Never reached if the caller went away first.
+   let ended = stream::once(async move { eof.note_upstream_eof() }).filter_map(|()| async { None });
+   let stream = resp
+      .bytes_stream()
+      .eventsource()
+      .filter_map(move |event| {
+         let _ = &guard;
+         let capture = capture.clone();
+         async move {
+            match event {
+               Ok(event) => {
+                  if !event.event.is_empty() {
+                     capture.note_event(&event.event);
+                  }
+                  capture.note_bytes(event.data.len());
+                  if let Ok(parsed) = serde_json::from_str::<ResponsesEvent>(&event.data) {
+                     capture.observe(&parsed);
+                  }
+                  if event.data.starts_with(r#"{"type":"error""#)
+                     || event.data.starts_with(r#"{"type":"response.failed""#)
+                  {
+                     let head: String = event.data.chars().take(600).collect();
+                     tracing::warn!(frame = %head, "upstream failed inside a 200");
+                  }
+                  let mut out = Event::default().data(restore_reserved_namespace(event.data));
+                  if !event.event.is_empty() && event.event != "message" {
+                     out = out.event(event.event);
+                  }
+                  Some(Ok::<_, Infallible>(out))
+               },
+               Err(err) => {
+                  tracing::warn!("passthrough SSE error: {err}");
+                  capture.fail("upstream_sse_error");
+                  None
+               },
+            }
          }
-         polled
-      }
-   }
-   let eof_capture = capture.clone();
-   let stream = resp.bytes_stream().eventsource().filter_map(move |event| {
-      let capture = capture.clone();
-      async move {
-         match event {
-            Ok(event) => {
-               if !event.event.is_empty() {
-                  capture.note_event(&event.event);
-               }
-               capture.note_bytes(event.data.len());
-               if let Ok(parsed) = serde_json::from_str::<ResponsesEvent>(&event.data) {
-                  capture.observe(&parsed);
-               }
-               if event.data.starts_with(r#"{"type":"error""#)
-                  || event.data.starts_with(r#"{"type":"response.failed""#)
-               {
-                  let head: String = event.data.chars().take(600).collect();
-                  tracing::warn!(frame = %head, "upstream failed inside a 200");
-               }
-               let mut out = Event::default().data(restore_reserved_namespace(event.data));
-               if !event.event.is_empty() && event.event != "message" {
-                  out = out.event(event.event);
-               }
-               Some(Ok::<_, Infallible>(out))
-            },
-            Err(err) => {
-               tracing::warn!("passthrough SSE error: {err}");
-               capture.fail("upstream_sse_error");
-               None
-            },
-         }
-      }
-   });
-   let held = Held {
-      inner: Box::pin(stream),
-      capture: eof_capture,
-      _guard: guard,
-   };
-   let mut response = Sse::new(held)
+      })
+      .chain(ended);
+   Sse::new(stream)
       .keep_alive(KeepAlive::default())
-      .into_response();
-   for (name, value) in limits {
-      if let (Ok(name), Ok(value)) = (HeaderName::try_from(name), HeaderValue::try_from(value)) {
-         response.headers_mut().insert(name, value);
-      }
-   }
-   response
+      .into_response()
 }
 
 #[cfg(test)]

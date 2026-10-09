@@ -1,9 +1,8 @@
-use std::str::FromStr;
-
 use eyre::Result;
-use rusqlite::{OptionalExtension as _, Row, TransactionBehavior, params, types::FromSqlError};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, Value, ValueRef};
+use rusqlite::{OptionalExtension as _, Row, params};
 
-use super::Db;
+use crate::db::Db;
 use crate::oauth::TokenSet;
 use crate::provider::{AuthMode, Provider};
 
@@ -24,15 +23,13 @@ impl AccountStatus {
    }
 }
 
-impl FromStr for AccountStatus {
-   type Err = String;
-   fn from_str(s: &str) -> Result<Self, Self::Err> {
-      match s {
-         "active" => Ok(Self::Active),
-         "cooldown" => Ok(Self::Cooldown),
-         "disabled" => Ok(Self::Disabled),
-         other => Err(format!("unknown account status {other:?}")),
-      }
+impl FromSql for AccountStatus {
+   fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+      let text = value.as_str()?;
+      [Self::Active, Self::Cooldown, Self::Disabled]
+         .into_iter()
+         .find(|status| status.as_str() == text)
+         .ok_or_else(|| FromSqlError::Other(format!("unknown account status {text:?}").into()))
    }
 }
 
@@ -42,6 +39,9 @@ pub struct Account {
    pub provider: Provider,
    pub provider_account_id: String,
    pub trusted: bool,
+   /// Only served to tokens with `reserved_only`; never to the shared pool.
+   pub reserved: bool,
+   pub egress: bool,
    pub allowed_users: Vec<String>,
    pub auth_mode: AuthMode,
    pub email: Option<String>,
@@ -50,6 +50,7 @@ pub struct Account {
    pub access_token: String,
    pub refresh_token: String,
    pub http_referer: Option<String>,
+   pub turn_state: Option<String>,
    pub access_expires_at: Option<i64>,
    pub status: AccountStatus,
    pub cooldown_until: Option<i64>,
@@ -70,6 +71,8 @@ fn from_row(row: &Row) -> rusqlite::Result<Account> {
       provider: row.get("provider")?,
       provider_account_id: row.get("provider_account_id")?,
       trusted: row.get("trusted")?,
+      reserved: row.get("reserved")?,
+      egress: row.get("egress")?,
       allowed_users: parse_users(&row.get::<_, String>("allowed_users")?),
       auth_mode: row.get("auth_mode")?,
       email: row.get("email")?,
@@ -78,18 +81,37 @@ fn from_row(row: &Row) -> rusqlite::Result<Account> {
       access_token: row.get("access_token")?,
       refresh_token: row.get("refresh_token")?,
       http_referer: row.get("http_referer")?,
+      turn_state: row.get("turn_state")?,
       access_expires_at: row.get("access_expires_at")?,
-      status: {
-         let raw: String = row.get("status")?;
-         raw.parse()
-            .map_err(|err: String| FromSqlError::Other(err.into()))?
-      },
+      status: row.get("status")?,
       cooldown_until: row.get("cooldown_until")?,
       disabled_reason: row.get("disabled_reason")?,
    })
 }
 
-const COLS: &str = "id, provider, provider_account_id, trusted, auth_mode, email, label, plan_type, access_token, refresh_token, http_referer, access_expires_at, status, cooldown_until, disabled_reason, allowed_users";
+const COLS: &str = "id, provider, provider_account_id, trusted, reserved, egress, auth_mode, email, label, plan_type, access_token, refresh_token, http_referer, turn_state, access_expires_at, status, cooldown_until, disabled_reason, allowed_users";
+
+pub enum AccountField {
+   Trusted(bool),
+   Egress(bool),
+   Reserved(bool),
+   AllowedUsers(String),
+   HttpReferer(Option<String>),
+   TurnState(String),
+}
+
+impl AccountField {
+   fn column(self) -> (&'static str, Value) {
+      match self {
+         Self::Trusted(enabled) => ("trusted", enabled.into()),
+         Self::Egress(enabled) => ("egress", enabled.into()),
+         Self::Reserved(enabled) => ("reserved", enabled.into()),
+         Self::AllowedUsers(users) => ("allowed_users", users.into()),
+         Self::HttpReferer(referer) => ("http_referer", referer.into()),
+         Self::TurnState(token) => ("turn_state", token.into()),
+      }
+   }
+}
 
 pub struct NewAccount<'a> {
    pub provider: Provider,
@@ -184,45 +206,15 @@ impl Db {
          .await
    }
 
-   /// Whether an account participates in fleet-wide OpenAI quota policy.
-   /// Empty allowlists are shared; a one-user allowlist is personal.
-   pub async fn is_shared_account(&self, account_id: i64) -> Result<bool> {
+   pub async fn remove_account(&self, id: i64) -> Result<usize> {
       self
          .call(move |conn| {
-            let Some((provider, allowed_users)) = conn
-               .query_row(
-                  "SELECT provider, allowed_users FROM accounts WHERE id = ?1",
-                  [account_id],
-                  |row| Ok((row.get::<_, Provider>(0)?, row.get::<_, String>(1)?)),
-               )
-               .optional()?
-            else {
-               return Ok(false);
-            };
-            Ok(provider == Provider::OpenAi && parse_users(&allowed_users).len() != 1)
-         })
-         .await
-   }
-
-   pub async fn remove_account(&self, key: &str) -> Result<usize> {
-      let key = key.to_owned();
-      self
-         .call(move |conn| {
-            let id = key.parse::<i64>().unwrap_or(-1);
-            let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Keep historical usage rows, but detach them from the account so
-            // the account can be removed without violating the foreign key.
+            let txn = conn.transaction()?;
             txn.execute(
-               "UPDATE usage_log SET account_id = NULL
-                WHERE account_id IN (
-                   SELECT id FROM accounts WHERE id = ?1 OR email = ?2 OR label = ?2
-                )",
-               params![id, key],
+               "UPDATE usage_log SET account_id = NULL WHERE account_id = ?1",
+               params![id],
             )?;
-            let removed = txn.execute(
-               "DELETE FROM accounts WHERE id = ?1 OR email = ?2 OR label = ?2",
-               params![id, key],
-            )?;
+            let removed = txn.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
             txn.commit()?;
             Ok(removed)
          })
@@ -250,44 +242,47 @@ impl Db {
          .await
    }
 
-   pub async fn set_account_trusted(&self, key: &str, trusted: bool) -> Result<usize> {
-      let key = key.to_owned();
+   /// Whether an account participates in fleet-wide OpenAI quota policy.
+   /// Empty allowlists are shared; a one-user allowlist is personal.
+   pub async fn is_shared_account(&self, id: i64) -> Result<bool> {
       self
          .call(move |conn| {
-            let id = key.parse::<i64>().unwrap_or(-1);
-            Ok(conn.execute(
-               "UPDATE accounts SET trusted = ?3, updated_at = unixepoch()
-             WHERE id = ?1 OR email = ?2 OR label = ?2",
-               params![id, key, trusted],
-            )?)
+            let Some((provider, allowed_users)) = conn
+               .query_row(
+                  "SELECT provider, allowed_users FROM accounts WHERE id = ?1",
+                  [id],
+                  |row| Ok((row.get::<_, Provider>(0)?, row.get::<_, String>(1)?)),
+               )
+               .optional()?
+            else {
+               return Ok(false);
+            };
+            Ok(provider == Provider::OpenAi && parse_users(&allowed_users).len() != 1)
          })
          .await
    }
 
+   #[cfg(test)]
    pub async fn set_account_allowed_users(&self, key: &str, users: &str) -> Result<usize> {
-      let key = key.to_owned();
-      let users = users.to_owned();
+      let account = self
+         .find_account(key)
+         .await?
+         .ok_or_else(|| eyre::eyre!("account not found: {key}"))?;
       self
-         .call(move |conn| {
-            let id = key.parse::<i64>().unwrap_or(-1);
-            Ok(conn.execute(
-               "UPDATE accounts SET allowed_users = ?3, updated_at = unixepoch()
-                   WHERE id = ?1 OR email = ?2 OR label = ?2",
-               params![id, key, users],
-            )?)
-         })
+         .set_account(account.id, AccountField::AllowedUsers(users.to_owned()))
          .await
    }
 
-   pub async fn set_account_http_referer(&self, id: i64, referer: Option<&str>) -> Result<()> {
-      let referer = referer.map(str::to_owned);
+   pub async fn set_account(&self, id: i64, field: AccountField) -> Result<usize> {
+      let (column, value) = field.column();
       self
          .call(move |conn| {
-            conn.execute(
-               "UPDATE accounts SET http_referer = ?2, updated_at = unixepoch() WHERE id = ?1",
-               params![id, referer],
-            )?;
-            Ok(())
+            Ok(conn.execute(
+               &format!(
+                  "UPDATE accounts SET {column} = ?2, updated_at = unixepoch() WHERE id = ?1"
+               ),
+               params![id, value],
+            )?)
          })
          .await
    }

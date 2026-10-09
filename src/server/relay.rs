@@ -1,24 +1,24 @@
+use std::mem;
+use std::time::{Duration, Instant};
+
 use axum::body::{Body, Bytes};
-use axum::http::HeaderMap;
 use axum::http::response::Builder;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use std::io::{Result, Write};
-use std::time::Instant;
+use tokio::time::timeout;
 
-use super::auth::AuthInfo;
-use super::error::{Dialect, error_response, pool_error_response};
-use super::pipeline::{dispatch_failed, read_body, relayed};
-use super::{AppState, LogGuard, log_error, log_usage};
-use crate::anthropic::client::RelayHeaders;
+use crate::anthropic::RelayHeaders;
 use crate::config::ModelsConfig;
-use crate::db::usage::UsageRecord;
 use crate::pool::anthropic::Relay as AnthropicRelay;
-use crate::pool::experiential::Relay as ExperientialRelay;
-use crate::pool::glm::Relay as GlmRelay;
-use crate::pool::{PoolError, Route, UsageWindow};
+use crate::pool::{PoolError, Relay, Route, Served, UsageWindow};
 use crate::provider::Provider;
+use crate::server::auth::AuthInfo;
+use crate::server::error::{Dialect, error_response, pool_error_response};
+use crate::server::facts::RequestFacts;
+use crate::server::pipeline::{self, Scan, respond};
+use crate::server::{AppState, log_error};
 use crate::translate::UsageCapture;
 use crate::translate::anthropic_req::AnthropicRequest;
 use crate::translate::model_map::resolve;
@@ -82,26 +82,15 @@ impl Peek {
    /// Claude Code's `metadata.user_id` is stable for a session, which is
    /// exactly the granularity upstream prompt caching wants.
    fn session_key(&self, auth: &AuthInfo) -> String {
-      struct HashWriter(hmac_sha256::Hash);
-      impl Write for HashWriter {
-         fn write(&mut self, buf: &[u8]) -> Result<usize> {
-            self.0.update(buf);
-            Ok(buf.len())
-         }
-         fn flush(&mut self) -> Result<()> {
-            Ok(())
-         }
-      }
-
       if let Some(uid) = self.user_id.as_ref() {
          return uid.clone();
       }
-      let mut hasher = HashWriter(hmac_sha256::Hash::new());
-      hasher.0.update(auth.user.as_bytes());
+      let mut hasher = hmac_sha256::Hash::new();
+      hasher.update(auth.user.as_bytes());
       if let Some(system) = self.system.as_ref() {
-         let _ = serde_json::to_writer(&mut hasher, system);
+         hasher.update(system.get());
       }
-      let digest = hasher.0.finalize();
+      let digest = hasher.finalize();
       format!(
          "sys-{:016x}",
          u64::from_le_bytes(digest[..8].try_into().unwrap())
@@ -110,16 +99,13 @@ impl Peek {
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
+#[serde(default)]
 struct RelayUsage {
-   #[serde(default)]
    input_tokens: i64,
-   #[serde(default)]
    output_tokens: i64,
-   #[serde(default)]
    cache_read_input_tokens: i64,
    /// Priced above fresh input, so dropping it undercounts the users who
    /// start new sessions most.
-   #[serde(default)]
    cache_creation_input_tokens: i64,
 }
 
@@ -160,13 +146,12 @@ struct ContentBlock {
    name: Option<String>,
 }
 
+pub fn header_str<'map>(headers: &'map HeaderMap, name: &str) -> Option<&'map str> {
+   headers.get(name)?.to_str().ok()
+}
+
 fn relay_headers(headers: &HeaderMap) -> RelayHeaders {
-   let get = |name: &str| {
-      headers
-         .get(name)
-         .and_then(|value| value.to_str().ok())
-         .map(String::from)
-   };
+   let get = |name: &str| header_str(headers, name).map(String::from);
    RelayHeaders {
       version: get("anthropic-version"),
       beta: get("anthropic-beta"),
@@ -177,47 +162,49 @@ fn relay_headers(headers: &HeaderMap) -> RelayHeaders {
 /// The beta and the user agent Claude Code sends on every call. A request
 /// missing either is some other client wearing an Anthropic API shape.
 fn is_claude_code(headers: &HeaderMap) -> bool {
-   let has = |name: &str, want: &str| {
-      headers
-         .get(name)
-         .and_then(|value| value.to_str().ok())
-         .is_some_and(|value| value.contains(want))
-   };
+   let has =
+      |name: &str, want: &str| header_str(headers, name).is_some_and(|value| value.contains(want));
    has("anthropic-beta", "claude-code-") && has("user-agent", "claude-cli/")
 }
 
 /// Logs what the caller actually sent, because the payload alone cannot tell
 /// a refused harness apart from a Claude Code request missing its headers.
-fn not_claude_code(user: &str, headers: &HeaderMap) -> Response {
-   let show = |name: &str| {
-      headers
-         .get(name)
-         .and_then(|value| value.to_str().ok())
-         .unwrap_or("<absent>")
-   };
+fn refuses_non_claude_code(
+   state: &AppState,
+   auth: &AuthInfo,
+   headers: &HeaderMap,
+) -> Option<Response> {
+   if !state.cfg.anthropic.require_claude_code
+      || auth.limits.reserved_only
+      || is_claude_code(headers)
+   {
+      return None;
+   }
+   let show = |name: &str| header_str(headers, name).unwrap_or("<absent>");
    tracing::warn!(
-      "refusing non-claude-code request from {user}: user-agent={:?} anthropic-beta={:?}",
+      "refusing non-claude-code request from {}: user-agent={:?} anthropic-beta={:?}",
+      auth.user,
       show("user-agent"),
       show("anthropic-beta"),
    );
-   error_response(
+   Some(error_response(
       DIALECT,
-      403,
+      StatusCode::FORBIDDEN,
       "permission_error",
       "this proxy serves Anthropic subscriptions, which only cover Claude Code",
-   )
+   ))
 }
 
 /// The body goes upstream untouched, so the parse here only feeds the log.
-fn anthropic_facts(body: &[u8], headers: &HeaderMap) -> super::facts::RequestFacts {
+fn anthropic_facts(body: &[u8], headers: &HeaderMap) -> RequestFacts {
    serde_json::from_slice::<AnthropicRequest>(body).map_or_else(
-      |_| super::facts::RequestFacts::empty(headers),
-      |req| super::facts::RequestFacts::from_anthropic(&req, headers),
+      |_| RequestFacts::empty(headers),
+      |req| RequestFacts::from_anthropic(&req, headers),
    )
 }
 
-fn normalized_body(body: &Bytes, peek: &Peek) -> Bytes {
-   if peek.model == peek.upstream_model {
+fn normalized_body(body: &Bytes, peek: &Peek, provider: Provider) -> Bytes {
+   if peek.model == peek.upstream_model && provider != Provider::Glm {
       return body.clone();
    }
    let Ok(mut value) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body)
@@ -228,14 +215,48 @@ fn normalized_body(body: &Bytes, peek: &Peek) -> Bytes {
       "model".into(),
       serde_json::Value::String(peek.upstream_model.clone()),
    );
+   if provider == Provider::Glm {
+      mark_cache_breakpoint(&mut value);
+   }
    Bytes::from(serde_json::to_vec(&value).expect("request serializes"))
 }
 
-/// Z.ai answers the messages API directly, so this is the anthropic relay
-/// without the subscription guard, which covers Claude Code and not a paid
-/// third-party key.
-/// The Experiential gateway answers the messages API directly, same shape
-/// as the z.ai relay.
+/// `ZCode` marks its last message as a cache breakpoint, so the coding plan
+/// bills a cached prefix the way it does for its own client.
+fn mark_cache_breakpoint(value: &mut serde_json::Map<String, serde_json::Value>) {
+   let Some(last) = value
+      .get_mut("messages")
+      .and_then(serde_json::Value::as_array_mut)
+      .and_then(|messages| messages.last_mut())
+   else {
+      return;
+   };
+   if let Some(content) = last.get_mut("content")
+      && let serde_json::Value::String(ref mut text) = *content
+   {
+      let blocks = serde_json::json!([{ "type": "text", "text": mem::take(text) }]);
+      *content = blocks;
+   }
+   let Some(blocks) = last
+      .get_mut("content")
+      .and_then(serde_json::Value::as_array_mut)
+   else {
+      return;
+   };
+   if blocks
+      .iter()
+      .any(|block| block.get("cache_control").is_some())
+   {
+      return;
+   }
+   if let Some(block) = blocks.last_mut().and_then(serde_json::Value::as_object_mut) {
+      block.insert(
+         "cache_control".into(),
+         serde_json::json!({ "type": "ephemeral" }),
+      );
+   }
+}
+
 pub async fn messages(
    state: AppState,
    auth: AuthInfo,
@@ -245,9 +266,8 @@ pub async fn messages(
    provider: Provider,
 ) -> Response {
    let started = Instant::now();
-   let key = peek.session_key(&auth);
    let facts = anthropic_facts(&body, &headers);
-   let mut record = super::pipeline::record(
+   let mut record = pipeline::record(
       &auth,
       "messages",
       provider,
@@ -256,144 +276,141 @@ pub async fn messages(
       facts,
    );
    record.effort = peek.effort.clone();
-   record.session_key = key.clone();
+   record.session_key = peek.session_key(&auth);
    if provider == Provider::Anthropic
-      && state.cfg.anthropic.require_claude_code
-      && !is_claude_code(&headers)
+      && let Some(refused) = refuses_non_claude_code(&state, &auth, &headers)
    {
       log_error(&state, record, 403, "not_claude_code");
-      return not_claude_code(&auth.user, &headers);
+      return refused;
    }
-   let route = Route {
-      session_key: &key,
-      model: &peek.upstream_model,
-      service_tier: None,
-      user: &auth.user,
-      pinned_account: auth.limits.pinned_account,
-      prefer_trusted: false,
-      five_hour_limit: None,
-      weekly_limit: None,
-   };
-   let body = normalized_body(&body, &peek);
-   let result = match provider {
-      Provider::Anthropic => {
-         state
-            .pools
-            .anthropic
-            .execute(
-               route,
-               AnthropicRelay {
-                  path: "/v1/messages",
-                  body,
-                  hdrs: relay_headers(&headers),
-               },
-            )
-            .await
-      },
-      Provider::Glm => {
-         state
-            .pools
-            .glm
-            .execute(
-               route,
-               GlmRelay {
-                  path: "/v1/messages",
-                  body,
-               },
-            )
-            .await
-      },
-      Provider::Experiential => {
-         state
-            .pools
-            .experiential
-            .execute(
-               route,
-               ExperientialRelay {
-                  path: "/v1/messages",
-                  body,
-               },
-            )
-            .await
-      },
-      Provider::OpenAi | Provider::Gemini | Provider::Zen => Err(PoolError::BadRequest {
-         provider,
-         model: peek.upstream_model.clone(),
-         body: "not served over the messages api".into(),
-      }),
-   };
-   let (account_id, resp) = match result {
-      Ok(result) => result,
-      Err(err) => return dispatch_failed(&state, record, DIALECT, err),
-   };
-   record.account_id = account_id;
-   record.status = i64::from(resp.status().as_u16());
-   let mut builder = forwarded_response(&resp);
-   if provider == Provider::Anthropic {
-      for (name, value) in pool_rate_limit_headers(
+   let route = auth.route(&record.session_key, &peek.upstream_model);
+   let body = normalized_body(&body, &peek, provider);
+   let (served, first) = dispatch(&state, route, provider, body, &headers, &peek).await;
+   let limits = if provider == Provider::Anthropic && served.is_ok() {
+      pool_rate_limit_headers(
          &state
             .pools
             .anthropic
             .pool_windows(&auth.user, auth.limits.pinned_account, None)
             .await,
-      ) {
-         builder = builder.header(name, value);
-      }
-   }
-   relay_response(state, record, resp, builder, started).await
+      )
+   } else {
+      Vec::new()
+   };
+   let streaming = served
+      .as_ref()
+      .is_ok_and(|served| is_event_stream(&served.response));
+   pipeline::forward(
+      state,
+      record,
+      served,
+      limits,
+      started,
+      streaming,
+      |capture| SseScan::new(capture, first),
+   )
+   .await
 }
 
-async fn relay_response(
-   state: AppState,
-   mut record: UsageRecord,
-   resp: reqwest::Response,
-   builder: Builder,
-   started: Instant,
-) -> Response {
-   let streaming = resp
-      .headers()
-      .get("content-type")
-      .and_then(|value| value.to_str().ok())
-      .is_some_and(|content_type| content_type.contains("text/event-stream"));
-
-   if streaming {
-      let capture = UsageCapture::default();
-      let mut scan = SseScan::new(capture.clone());
-      return relayed(
-         builder,
-         resp,
-         LogGuard::new(state, capture.clone(), record, started),
-         capture,
-         DIALECT,
-         move |bytes| {
-            scan.feed(&bytes);
-            bytes
-         },
-         Bytes::new,
-      );
-   }
-
-   let ok = resp.status().is_success();
-   let bytes = match read_body(&state, &record, DIALECT, resp).await {
-      Ok(bytes) => bytes,
-      Err(resp) => return resp,
+/// Hands the body to whichever pool serves the model. Zen is the one backend
+/// that must see its opening frame before the response counts as started, so
+/// that frame comes back alongside the result for the caller to re-emit.
+async fn dispatch(
+   state: &AppState,
+   route: Route<'_>,
+   provider: Provider,
+   body: Bytes,
+   headers: &HeaderMap,
+   peek: &Peek,
+) -> (Result<Served<reqwest::Response>, PoolError>, Option<Bytes>) {
+   let mut first = None;
+   let pools = &state.pools;
+   let relay = move |path| Relay { path, body };
+   let result = match provider {
+      Provider::Anthropic => {
+         let Relay { path, body: bytes } = relay("/v1/messages");
+         let hdrs = relay_headers(headers);
+         let request = AnthropicRelay {
+            path,
+            body: bytes,
+            hdrs,
+         };
+         pools.anthropic.execute(route, request).await
+      },
+      Provider::Glm => pools.glm.execute(route, relay("/v1/messages")).await,
+      Provider::DeepSeek => pools.deepseek.execute(route, relay("/v1/messages")).await,
+      Provider::Experiential => {
+         pools
+            .experiential
+            .execute(route, relay("/v1/messages"))
+            .await
+      },
+      Provider::Zen => {
+         let relay = relay("/messages");
+         let opened = timeout(ZEN_FIRST_FRAME, async {
+            let served = pools.zen.execute(route, relay).await?;
+            let mut resp = served.response;
+            let opening = if is_event_stream(&resp) {
+               resp
+                  .chunk()
+                  .await
+                  .map_err(|err| PoolError::Upstream(err.to_string()))?
+            } else {
+               None
+            };
+            Ok(Served {
+               account_id: served.account_id,
+               response: (resp, opening),
+               attempts: served.attempts,
+            })
+         })
+         .await;
+         match opened {
+            Ok(Ok(served))
+               if served.response.1.is_none() && is_event_stream(&served.response.0) =>
+            {
+               tracing::warn!(
+                  model = %peek.upstream_model,
+                  "zen answered 200 and closed the stream without a byte"
+               );
+               Err(PoolError::Upstream(
+                  "zen answered 200 and closed the stream without a byte".into(),
+               ))
+            },
+            Ok(Ok(served)) => {
+               first = served.response.1;
+               Ok(Served {
+                  account_id: served.account_id,
+                  response: served.response.0,
+                  attempts: served.attempts,
+               })
+            },
+            Ok(Err(err)) => Err(err),
+            Err(_) => {
+               tracing::warn!(
+                  model = %peek.upstream_model,
+                  "zen sent no frame before the deadline"
+               );
+               Err(PoolError::Upstream(
+                  "zen sent no frame before the deadline".into(),
+               ))
+            },
+         }
+      },
+      Provider::OpenAi | Provider::Gemini | Provider::Copilot => Err(PoolError::BadRequest {
+         provider,
+         model: peek.upstream_model.clone(),
+         body: "not served over the messages api".into(),
+      }),
    };
-   if ok {
-      if let Ok(msg) = serde_json::from_slice::<MessageEnvelope>(&bytes) {
-         record.input_tokens = msg.usage.input_tokens;
-         record.output_tokens = msg.usage.output_tokens;
-         record.cache_read_tokens = msg.usage.cache_read_input_tokens;
-         record.cache_write_tokens = msg.usage.cache_creation_input_tokens;
-      }
-   } else {
-      record.error_kind = Some("upstream_error".into());
-   }
-   record.duration_ms = Some(started.elapsed().as_millis() as i64);
-   record.response_bytes = bytes.len() as i64;
-   log_usage(&state, record);
-   builder
-      .body(Body::from(bytes))
-      .unwrap_or_else(|err| error_response(DIALECT, 502, "api_error", &err.to_string()))
+   (result, first)
+}
+
+const ZEN_FIRST_FRAME: Duration = Duration::from_secs(12);
+
+fn is_event_stream(resp: &reqwest::Response) -> bool {
+   header_str(resp.headers(), "content-type")
+      .is_some_and(|content_type| content_type.contains("text/event-stream"))
 }
 
 pub async fn count_tokens(
@@ -403,47 +420,40 @@ pub async fn count_tokens(
    body: Bytes,
    peek: Peek,
 ) -> Response {
-   if state.cfg.anthropic.require_claude_code && !is_claude_code(&headers) {
-      return not_claude_code(&auth.user, &headers);
+   if let Some(refused) = refuses_non_claude_code(&state, &auth, &headers) {
+      return refused;
    }
 
-   let hdrs = relay_headers(&headers);
    let key = peek.session_key(&auth);
    let resp = match state
       .pools
       .anthropic
       .execute(
-         Route {
-            session_key: &key,
-            model: &peek.upstream_model,
-            service_tier: None,
-            user: &auth.user,
-            pinned_account: auth.limits.pinned_account,
-            prefer_trusted: false,
-      five_hour_limit: None,
-      weekly_limit: None,
-         },
+         auth.route(&key, &peek.upstream_model),
          AnthropicRelay {
             path: "/v1/messages/count_tokens",
-            body: normalized_body(&body, &peek),
-            hdrs: hdrs.clone(),
+            body: normalized_body(&body, &peek, Provider::Anthropic),
+            hdrs: relay_headers(&headers),
          },
       )
       .await
    {
-      Ok((_, resp)) => resp,
+      Ok(served) => served.response,
       Err(err) => return pool_error_response(DIALECT, &state.cfg.models, err),
    };
    let builder = forwarded_response(&resp);
    match resp.bytes().await {
-      Ok(bytes) => builder
-         .body(Body::from(bytes))
-         .unwrap_or_else(|err| error_response(DIALECT, 502, "api_error", &err.to_string())),
-      Err(err) => error_response(DIALECT, 502, "api_error", &err.to_string()),
+      Ok(bytes) => respond(builder, DIALECT, Body::from(bytes)),
+      Err(err) => error_response(
+         DIALECT,
+         StatusCode::BAD_GATEWAY,
+         "api_error",
+         &err.to_string(),
+      ),
    }
 }
 
-pub(super) fn forwarded_response(resp: &reqwest::Response) -> Builder {
+pub fn forwarded_response(resp: &reqwest::Response) -> Builder {
    let mut builder = Response::builder().status(resp.status().as_u16());
    for (name, value) in resp.headers() {
       let key = name.as_str();
@@ -469,7 +479,7 @@ fn is_rate_limit_header(name: &str) -> bool {
 
 /// Claude Code warns on the utilization in these, so they carry the pool's
 /// figures rather than one account's.
-pub(super) fn pool_rate_limit_headers(windows: &[UsageWindow]) -> Vec<(String, String)> {
+pub fn pool_rate_limit_headers(windows: &[UsageWindow]) -> Vec<(String, String)> {
    let mut out = Vec::new();
    let mut soonest: Option<i64> = None;
    for window in windows {
@@ -506,14 +516,16 @@ struct SseScan {
    buf: String,
    interesting: bool,
    capture: UsageCapture,
+   first: Option<Bytes>,
 }
 
 impl SseScan {
-   const fn new(capture: UsageCapture) -> Self {
+   const fn new(capture: UsageCapture, first: Option<Bytes>) -> Self {
       Self {
          buf: String::new(),
          interesting: false,
          capture,
+         first,
       }
    }
 
@@ -543,6 +555,27 @@ impl SseScan {
    }
 }
 
+impl Scan for SseScan {
+   const DIALECT: Dialect = DIALECT;
+   const REJECTED: &'static str = "upstream_error";
+
+   fn chunk(&mut self, bytes: Bytes) -> Bytes {
+      self.feed(&bytes);
+      bytes
+   }
+
+   fn body(&mut self, bytes: Bytes) -> Result<Bytes, String> {
+      if let Ok(message) = serde_json::from_slice::<MessageEnvelope>(&bytes) {
+         apply_event(&self.capture, RelayEvent::MessageStart { message });
+      }
+      Ok(bytes)
+   }
+
+   fn head(&mut self) -> Option<Bytes> {
+      self.first.take()
+   }
+}
+
 fn apply_event(capture: &UsageCapture, event: RelayEvent) {
    let mut guard = capture.0.lock().unwrap();
    match event {
@@ -555,6 +588,13 @@ fn apply_event(capture: &UsageCapture, event: RelayEvent) {
       RelayEvent::MessageDelta { usage, delta } => {
          if let Some(usage) = usage {
             guard.output_tokens = usage.output_tokens;
+            // Zen reports a streamed turn's input as zero in message_start
+            // and only settles it here, where anthropic sends nothing.
+            if usage.input_tokens > 0 {
+               guard.input_tokens = usage.input_tokens;
+               guard.cache_read_tokens = usage.cache_read_input_tokens;
+               guard.cache_write_tokens = usage.cache_creation_input_tokens;
+            }
          }
          if let Some(reason) = delta.and_then(|stop| stop.stop_reason) {
             guard.stop_reason = Some(reason);
@@ -619,6 +659,25 @@ mod tests {
          ("anthropic-beta", "oauth-2025-04-20"),
          ("user-agent", "python-httpx/0.27"),
       ])));
+   }
+
+   #[test]
+   fn only_glm_bodies_are_rewritten() {
+      use crate::config::ModelsConfig;
+      use crate::provider::Provider;
+
+      let body = super::Bytes::from_static(
+         br#"{"model":"glm-5","messages":[{"role":"user","content":"hi"}]}"#,
+      );
+      let peek = super::Peek::from_slice(&body, &ModelsConfig::default());
+      let anthropic = super::normalized_body(&body, &peek, Provider::Anthropic);
+      assert_eq!(anthropic, body);
+      let glm = super::normalized_body(&body, &peek, Provider::Glm);
+      let parsed: serde_json::Value = serde_json::from_slice(&glm).unwrap();
+      assert_eq!(
+         parsed["messages"][0]["content"][0]["cache_control"]["type"],
+         "ephemeral"
+      );
    }
 }
 

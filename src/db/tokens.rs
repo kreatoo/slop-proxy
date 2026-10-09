@@ -2,7 +2,7 @@ use eyre::Result;
 use rand::RngCore as _;
 use rusqlite::params;
 
-use super::Db;
+use crate::db::Db;
 use crate::provider::Provider;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,8 @@ pub struct TokenLimits {
    /// Maximum Codex 7-day quota utilization allowed for this token.
    pub weekly_limit: Option<f64>,
    pub prefer_trusted: bool,
+   /// Only this token's requests may use reserved accounts, and it uses nothing else.
+   pub reserved_only: bool,
    /// The one account this token may be served by. `None` leaves it free to
    /// use any account the pool offers.
    pub pinned_account: Option<i64>,
@@ -49,7 +51,9 @@ impl TokenLimits {
    }
 
    fn decode(raw: &str) -> Vec<Provider> {
-      raw.split(',').filter_map(Provider::from_str).collect()
+      raw.split(',')
+         .filter_map(|name| name.parse().ok())
+         .collect()
    }
 }
 
@@ -90,37 +94,30 @@ impl Db {
 
    pub async fn list_tokens(&self) -> Result<Vec<ApiToken>> {
       self
-         .call(move |conn| {
-            let mut stmt = conn.prepare(
-               "SELECT id, user, token_prefix, created_at, revoked_at,
-                    request_limit, token_limit, window_seconds, slowdown_ms,
-                    five_hour_limit, weekly_limit, prefer_trusted, pinned_account,
-                    allowed_providers
-             FROM api_tokens ORDER BY id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-               Ok(ApiToken {
-                  id: row.get(0)?,
-                  user: row.get(1)?,
-                  token_prefix: row.get(2)?,
-                  created_at: row.get(3)?,
-                  revoked_at: row.get(4)?,
-                  limits: TokenLimits {
-                     requests: row.get(5)?,
-                     tokens: row.get(6)?,
-                     window_seconds: row.get(7)?,
-                     slowdown_ms: row.get(8)?,
-                     five_hour_limit: row.get(9)?,
-                     weekly_limit: row.get(10)?,
-                     prefer_trusted: row.get(11)?,
-                     pinned_account: row.get(12)?,
-                     providers: TokenLimits::decode(&row.get::<_, String>(13)?),
-                  },
-               })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
-         })
+         .writer
+         .rows(
+            format!("SELECT {API_TOKEN_COLS} FROM api_tokens ORDER BY id"),
+            [],
+            api_token_from_row,
+         )
          .await
+   }
+
+   pub async fn find_token(&self, key: &str) -> Result<Option<ApiToken>> {
+      let id = key.parse::<i64>().unwrap_or(-1);
+      let key = key.to_owned();
+      let mut found = self
+         .writer
+         .rows(
+            format!(
+               "SELECT {API_TOKEN_COLS} FROM api_tokens
+                WHERE id = ?1 OR token_prefix = ?2 ORDER BY id LIMIT 1"
+            ),
+            (id, key),
+            api_token_from_row,
+         )
+         .await?;
+      Ok(found.pop())
    }
 
    pub async fn revoke_token(&self, key: &str) -> Result<usize> {
@@ -147,7 +144,7 @@ impl Db {
                "UPDATE api_tokens
              SET request_limit = ?3, token_limit = ?4, window_seconds = ?5, slowdown_ms = ?6,
                  five_hour_limit = ?7, weekly_limit = ?8, prefer_trusted = ?9,
-                 pinned_account = ?10, allowed_providers = ?11
+                 reserved_only = ?10, pinned_account = ?11, allowed_providers = ?12
              WHERE id = ?1 OR token_prefix = ?2",
                params![
                   id,
@@ -159,6 +156,7 @@ impl Db {
                   limits.five_hour_limit,
                   limits.weekly_limit,
                   limits.prefer_trusted,
+                  limits.reserved_only,
                   limits.pinned_account,
                   limits.encode(),
                ],
@@ -172,8 +170,8 @@ impl Db {
       self
          .call(move |conn| {
             let mut stmt = conn.prepare(
-               "SELECT id, user, request_limit, token_limit, window_seconds, slowdown_ms,
-                    five_hour_limit, weekly_limit, prefer_trusted, pinned_account,
+               "SELECT id, user, request_limit, token_limit, five_hour_limit, weekly_limit,
+                    window_seconds, slowdown_ms, prefer_trusted, reserved_only, pinned_account,
                     allowed_providers
              FROM api_tokens WHERE token_hash = ?1 AND revoked_at IS NULL",
             )?;
@@ -181,23 +179,43 @@ impl Db {
                Ok(AuthenticatedToken {
                   id: row.get(0)?,
                   user: row.get(1)?,
-                  limits: TokenLimits {
-                     requests: row.get(2)?,
-                     tokens: row.get(3)?,
-                     window_seconds: row.get(4)?,
-                     slowdown_ms: row.get(5)?,
-                     five_hour_limit: row.get(6)?,
-                     weekly_limit: row.get(7)?,
-                     prefer_trusted: row.get(8)?,
-                     pinned_account: row.get(9)?,
-                     providers: TokenLimits::decode(&row.get::<_, String>(10)?),
-                  },
+                  limits: limits_from_row(row, 2)?,
                })
             })?;
             Ok(rows.next().transpose()?)
          })
          .await
    }
+}
+
+const API_TOKEN_COLS: &str = "id, user, token_prefix, created_at, revoked_at,
+   request_limit, token_limit, five_hour_limit, weekly_limit, window_seconds, slowdown_ms,
+   prefer_trusted, reserved_only, pinned_account, allowed_providers";
+
+fn api_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiToken> {
+   Ok(ApiToken {
+      id: row.get(0)?,
+      user: row.get(1)?,
+      token_prefix: row.get(2)?,
+      created_at: row.get(3)?,
+      revoked_at: row.get(4)?,
+      limits: limits_from_row(row, 5)?,
+   })
+}
+
+fn limits_from_row(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<TokenLimits> {
+   Ok(TokenLimits {
+      requests: row.get(base)?,
+      tokens: row.get(base + 1)?,
+      five_hour_limit: row.get(base + 2)?,
+      weekly_limit: row.get(base + 3)?,
+      window_seconds: row.get(base + 4)?,
+      slowdown_ms: row.get(base + 5)?,
+      prefer_trusted: row.get(base + 6)?,
+      reserved_only: row.get(base + 7)?,
+      pinned_account: row.get(base + 8)?,
+      providers: TokenLimits::decode(&row.get::<_, String>(base + 9)?),
+   })
 }
 
 #[cfg(test)]

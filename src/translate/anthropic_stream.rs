@@ -3,7 +3,7 @@ use serde_json::value::RawValue;
 
 use crate::codex::types::{ResponsesEvent, Usage};
 use crate::translate::{
-   Aggregated, Block, BlockEvent, Step, StopKind, UsageCapture, Walker, input_token_partition,
+   Aggregated, Block, BlockEvent, Step, UsageCapture, Walker, input_token_partition,
 };
 
 pub struct AnthropicStream {
@@ -64,8 +64,8 @@ impl AnthEvent {
          Self::MessageStop => "message_stop",
          Self::Error { .. } => "error",
       };
-      let value = serde_json::to_value(self).expect("event serializes");
-      (name, value.to_string())
+      let value = serde_json::to_string(&self).expect("event serializes");
+      (name, value)
    }
 }
 
@@ -172,9 +172,11 @@ impl AnthropicStream {
          .walker
          .eof()
          .into_iter()
-         .filter_map(|step| match step {
-            Step::Failed { message, .. } => Some(error("overloaded_error", message)),
-            Step::Start { .. } | Step::Block { .. } | Step::Stop { .. } => None,
+         .filter_map(|step| {
+            let Step::Failed { message, .. } = step else {
+               return None;
+            };
+            Some(error("overloaded_error", message))
          })
          .collect()
    }
@@ -228,8 +230,16 @@ impl AnthropicStream {
                   Channel::Call,
                ),
             };
-            self.blocks.push(Some((self.next_index, channel)));
-            self.open(out, content);
+            let index = self.next_index;
+            self.blocks.push(Some((index, channel)));
+            self.next_index += 1;
+            out.push(
+               AnthEvent::ContentBlockStart {
+                  index,
+                  content_block: content,
+               }
+               .out(),
+            );
          },
          Step::Block { index, event } => {
             let Some((index, channel)) = self.blocks[index] else {
@@ -248,7 +258,7 @@ impl AnthropicStream {
                },
                BlockEvent::Open(_) => return,
             };
-            out.push(Self::delta(index, delta));
+            out.push(AnthEvent::ContentBlockDelta { index, delta }.out());
          },
          Step::Stop { kind, usage } => {
             out.push(
@@ -274,22 +284,6 @@ impl AnthropicStream {
             out.push(error(kind, message));
          },
       }
-   }
-
-   fn open(&mut self, out: &mut Vec<OutEvent>, content_block: ContentBlockStart) {
-      let index = self.next_index;
-      self.next_index += 1;
-      out.push(
-         AnthEvent::ContentBlockStart {
-            index,
-            content_block,
-         }
-         .out(),
-      );
-   }
-
-   fn delta(index: usize, delta: BlockDelta) -> OutEvent {
-      AnthEvent::ContentBlockDelta { index, delta }.out()
    }
 }
 
@@ -361,11 +355,7 @@ pub fn render_aggregated(agg: &Aggregated, model: &str, emit_thinking: bool) -> 
          },
       }
    }
-   let stop_reason = match agg.stop {
-      StopKind::ToolUse => "tool_use",
-      StopKind::MaxTokens => "max_tokens",
-      StopKind::EndTurn | StopKind::Error => "end_turn",
-   };
+   let stop_reason = agg.stop.as_str();
    RenderedMessage {
       id: agg.id.clone(),
       kind: "message",

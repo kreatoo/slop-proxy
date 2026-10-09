@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 
-use crate::translate::chat::ChatError;
 use crate::translate::chat::ChatRequest;
 
-use super::{AuthPolicy, Backend, Cooldown, Pool, Route, Slot};
-use crate::gemini::client::{GeminiClient, GeminiProtocol, GeminiResponse};
+use crate::gemini::client::{GeminiClient, GeminiResponse};
 use crate::gemini::types::ListedModel;
+use crate::pool::{Backend, Cooldown, Pool, Route, Slot};
 use crate::provider::Provider;
+use crate::translate::bridge::BridgeProtocol;
 use crate::upstream::SendError;
 
 /// What to send upstream. A caller already speaking the native dialect skips
@@ -44,16 +44,9 @@ impl Backend for GeminiClient {
       max: 3600,
       base: RATE_LIMIT_COOLDOWN_SECS,
    };
-   // A static key cannot be refreshed into a working one, so a
-   // rejected key sits out rather than retrying in place.
-   const ON_AUTH: AuthPolicy = AuthPolicy::CoolKey(15 * 60);
    const STICKY_WAIT_SECS: i64 = STICKY_WAIT_SECS;
    type Request = Call;
    type Response = GeminiResponse;
-
-   fn reason(body: String) -> String {
-      ChatError::reason(body)
-   }
 
    fn soft_limit(&self) -> f64 {
       self.soft_utilization_limit()
@@ -91,7 +84,7 @@ impl Backend for GeminiClient {
          .await
          .map(|response| GeminiResponse {
             response,
-            protocol: GeminiProtocol::Native,
+            protocol: BridgeProtocol::GeminiNative,
          }),
       }
    }
@@ -100,20 +93,11 @@ impl Backend for GeminiClient {
 impl Pool<GeminiClient> {
    /// The first account that answers. Every key sees the same catalog, so
    /// there is nothing to merge across accounts.
-   pub async fn models(&self) -> Vec<ListedModel> {
-      for slot in self.slots.list().await {
-         let Ok(key) = self.slots.fresh_token(&slot, false).await else {
-            continue;
-         };
-         match self
-            .backend
-            .models(&key, slot.http_referer.as_deref())
-            .await
-         {
-            Ok(listed) => return listed,
-            Err(err) => tracing::debug!("models for {}: {err}", slot.display),
-         }
-      }
-      Vec::new()
+   pub async fn models(&self) -> Option<Vec<ListedModel>> {
+      self
+         .first_answer(async |backend, key, slot| {
+            backend.models(key, slot.http_referer.as_deref()).await
+         })
+         .await
    }
 }

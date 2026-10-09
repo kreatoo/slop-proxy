@@ -6,7 +6,6 @@ use serde::Serialize;
 
 use crate::config::ModelsConfig;
 use crate::pool::PoolError;
-use crate::provider::Provider;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Dialect {
@@ -41,8 +40,12 @@ struct OpenAiErrorBody<'a> {
    error: OpenAiErrorDetail<'a>,
 }
 
-pub fn error_response(dialect: Dialect, status: u16, err_type: &str, message: &str) -> Response {
-   let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+pub fn error_response(
+   dialect: Dialect,
+   status: StatusCode,
+   err_type: &str,
+   message: &str,
+) -> Response {
    let detail = ErrorDetail { err_type, message };
    let body = match dialect {
       Dialect::Anthropic => Json(AnthropicErrorBody {
@@ -66,7 +69,7 @@ pub fn pool_error_response(dialect: Dialect, models: &ModelsConfig, err: PoolErr
    match err {
       PoolError::NoAccounts(provider) => error_response(
          dialect,
-         503,
+         StatusCode::SERVICE_UNAVAILABLE,
          "api_error",
          &format!("no usable {provider} accounts; an admin must run `slop-proxy login`"),
       ),
@@ -77,23 +80,39 @@ pub fn pool_error_response(dialect: Dialect, models: &ModelsConfig, err: PoolErr
          };
          let mut resp = error_response(
             dialect,
-            429,
+            StatusCode::TOO_MANY_REQUESTS,
             err_type,
-            "estimated user quota budget or estimated USD budget exceeded; retry after the budget window resets",
+            "estimated user quota budget exceeded; retry later",
          );
-         if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
+         if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
             resp.headers_mut().insert("retry-after", value);
          }
          resp
       },
-      PoolError::AllCoolingDown { retry_after } => {
+      PoolError::SpendBudgetExceeded { retry_after } => {
          let err_type = match dialect {
             Dialect::Anthropic => "rate_limit_error",
             Dialect::OpenAi => "rate_limit_exceeded",
          };
          let mut resp = error_response(
             dialect,
-            429,
+            StatusCode::TOO_MANY_REQUESTS,
+            err_type,
+            "estimated USD budget exceeded; retry later",
+         );
+         if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+            resp.headers_mut().insert("retry-after", value);
+         }
+         resp
+      },
+      PoolError::AllCoolingDown { retry_after, .. } => {
+         let err_type = match dialect {
+            Dialect::Anthropic => "rate_limit_error",
+            Dialect::OpenAi => "rate_limit_exceeded",
+         };
+         let mut resp = error_response(
+            dialect,
+            StatusCode::TOO_MANY_REQUESTS,
             err_type,
             "all upstream accounts are rate limited; retry later",
          );
@@ -117,15 +136,27 @@ pub fn pool_error_response(dialect: Dialect, models: &ModelsConfig, err: PoolErr
                .unwrap_or_default();
             format!("the {provider} backend rejected {model}{hint}: {body}")
          };
-         error_response(dialect, 400, "invalid_request_error", &message)
+         error_response(
+            dialect,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &message,
+         )
       },
-      PoolError::Upstream(msg) => error_response(dialect, 502, "api_error", &msg),
+      PoolError::Upstream(msg) => {
+         error_response(dialect, StatusCode::BAD_GATEWAY, "api_error", &msg)
+      },
    }
 }
 
 pub fn translation_error(dialect: Dialect, msg: &str) -> Response {
    tracing::warn!("rejected a {dialect:?} request: {msg}");
-   error_response(dialect, 400, "invalid_request_error", msg)
+   error_response(
+      dialect,
+      StatusCode::BAD_REQUEST,
+      "invalid_request_error",
+      msg,
+   )
 }
 
 /// An untagged enum reports only that nothing matched, so the column serde
@@ -138,27 +169,4 @@ pub fn body_at(body: &[u8], error: &serde_json::Error) -> String {
    let start = column.saturating_sub(60);
    let end = (column + 600).min(body.len());
    String::from_utf8_lossy(&body[start..end]).into_owned()
-}
-
-pub const fn pool_error_status(err: &PoolError) -> i64 {
-   match *err {
-      PoolError::NoAccounts(_) => 503,
-      PoolError::AllCoolingDown { .. } | PoolError::UserQuotaExceeded { .. } => 429,
-      PoolError::BadRequest { .. } => 400,
-      PoolError::Upstream(_) => 502,
-   }
-}
-
-/// A 403 that says which provider the token lacks, so a scoped key does not
-/// read as the model being broken for everyone.
-pub fn out_of_scope(dialect: Dialect, provider: Provider) -> Response {
-   error_response(
-      dialect,
-      403,
-      "permission_error",
-      &format!(
-         "this token is not scoped to the {} backend",
-         provider.as_str()
-      ),
-   )
 }

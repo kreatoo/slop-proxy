@@ -3,20 +3,15 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::zen::ZenModel;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelInfo {
    pub slug: String,
    #[serde(default)]
    pub display_name: Option<String>,
-   #[serde(default)]
-   pub default_reasoning_level: Option<String>,
-   #[serde(default)]
-   pub supported_reasoning_levels: Vec<ReasoningLevel>,
-   #[serde(default)]
    pub visibility: Option<String>,
-   #[serde(default)]
    pub supported_in_api: Option<bool>,
-   #[serde(default)]
    pub context_window: Option<i64>,
    #[serde(default)]
    pub input_modalities: Vec<String>,
@@ -34,14 +29,6 @@ pub struct ServiceTier {
    pub id: String,
    pub name: String,
    pub description: String,
-   #[serde(flatten)]
-   pub rest: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ReasoningLevel {
-   #[serde(default)]
-   pub effort: String,
    #[serde(flatten)]
    pub rest: BTreeMap<String, Value>,
 }
@@ -116,19 +103,9 @@ impl ModelsResponse {
 
    pub fn merge(&mut self, incoming: &Self) {
       for candidate in &incoming.models {
-         if let Some(model) = self
-            .models
-            .iter_mut()
-            .find(|model| model.slug == candidate.slug)
-         {
+         if self.models.iter().any(|model| model.slug == candidate.slug) {
             for tier in &candidate.service_tiers {
-               if !model
-                  .service_tiers
-                  .iter()
-                  .any(|existing| existing.id == tier.id)
-               {
-                  model.service_tiers.push(tier.clone());
-               }
+               self.add_service_tier(&candidate.slug, tier.clone());
             }
          } else {
             self.models.push(candidate.clone());
@@ -159,7 +136,6 @@ impl ModelInfo {
 /// Codex's fallback for an unlisted slug lets code mode declare a `custom` tool zen refuses.
 #[derive(Serialize)]
 struct ZenEntry<'a> {
-   slug: &'a str,
    display_name: &'a str,
    description: &'static str,
    tool_mode: &'static str,
@@ -170,58 +146,86 @@ struct ZenEntry<'a> {
    prefer_websockets: bool,
    supports_search_tool: bool,
    experimental_supported_tools: [(); 0],
+   service_tiers: [(); 0],
+   additional_speed_tiers: [(); 0],
    priority: i32,
    upgrade: Option<()>,
    availability_nux: Option<()>,
    comp_hash: Option<()>,
    default_reasoning_level: &'static str,
-   service_tiers: [(); 0],
-   additional_speed_tiers: [(); 0],
-   supported_reasoning_levels: Vec<Value>,
 }
 
 const ZEN_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
+#[derive(Clone, Deserialize, Serialize)]
+struct CatalogEntry {
+   #[serde(skip_serializing_if = "Option::is_none")]
+   slug: Option<String>,
+   #[serde(skip_serializing_if = "Option::is_none")]
+   visibility: Option<String>,
+   #[serde(skip_serializing_if = "Option::is_none")]
+   supported_reasoning_levels: Option<Vec<ReasoningLevel>>,
+   #[serde(skip_serializing_if = "Option::is_none")]
+   context_window: Option<i64>,
+   #[serde(flatten)]
+   rest: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ReasoningLevel {
+   #[serde(skip_serializing_if = "Option::is_none")]
+   effort: Option<String>,
+   #[serde(flatten)]
+   rest: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Catalog {
+   models: Vec<CatalogEntry>,
+   #[serde(flatten)]
+   rest: BTreeMap<String, Value>,
+}
+
 /// Cloned from `template` so the fields codex requires track the backend.
-pub fn with_zen_entries(raw: &str, template: &str, ids: &[String]) -> Option<String> {
-   let mut catalog: Value = serde_json::from_str(raw).ok()?;
-   let models = catalog.get_mut("models")?.as_array_mut()?;
-   let present: Vec<String> = models
+pub fn with_zen_entries<'zen, Zen>(raw: &str, template: &str, zen: Zen) -> Option<String>
+where
+   Zen: IntoIterator<Item = &'zen ZenModel>,
+{
+   let mut catalog: Catalog = serde_json::from_str(raw).ok()?;
+   let present: Vec<String> = catalog
+      .models
       .iter()
-      .filter_map(|entry| entry.get("slug").and_then(Value::as_str).map(str::to_owned))
+      .filter_map(|entry| entry.slug.clone())
       .collect();
-   let base = models
+   let base = catalog
+      .models
       .iter()
-      .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(template))
+      .find(|entry| entry.slug.as_deref() == Some(template))
       .or_else(|| {
-         models
+         catalog
+            .models
             .iter()
-            .find(|entry| entry.get("visibility").and_then(Value::as_str) == Some("list"))
+            .find(|entry| entry.visibility.as_deref() == Some("list"))
       })?
-      .as_object()?
       .clone();
-   let levels: Vec<Value> = base
-      .get("supported_reasoning_levels")
-      .and_then(Value::as_array)
-      .map(|levels| {
-         levels
-            .iter()
-            .filter(|level| {
-               level
-                  .get("effort")
-                  .and_then(Value::as_str)
-                  .is_some_and(|effort| ZEN_EFFORTS.contains(&effort))
-            })
-            .cloned()
-            .collect()
+   let levels: Vec<ReasoningLevel> = base
+      .supported_reasoning_levels
+      .iter()
+      .flatten()
+      .filter(|level| {
+         level
+            .effort
+            .as_deref()
+            .is_some_and(|effort| ZEN_EFFORTS.contains(&effort))
       })
-      .unwrap_or_default();
-   for id in ids {
+      .cloned()
+      .collect();
+   for model in zen {
+      let id = &model.id;
       if present.contains(id) {
          continue;
       }
       let patch = serde_json::to_value(ZenEntry {
-         slug: id,
          display_name: id,
          description: "Served by opencode zen",
          tool_mode: "direct",
@@ -232,21 +236,23 @@ pub fn with_zen_entries(raw: &str, template: &str, ids: &[String]) -> Option<Str
          prefer_websockets: false,
          supports_search_tool: false,
          experimental_supported_tools: [],
+         service_tiers: [],
+         additional_speed_tiers: [],
          priority: 99,
          upgrade: None,
          availability_nux: None,
          comp_hash: None,
          default_reasoning_level: "high",
-         supported_reasoning_levels: levels.clone(),
-         service_tiers: [],
-         additional_speed_tiers: [],
       })
       .ok()?;
       let mut entry = base.clone();
+      entry.slug = Some(id.clone());
+      entry.supported_reasoning_levels = Some(levels.clone());
+      entry.context_window = model.context_window.or(base.context_window);
       if let Value::Object(fields) = patch {
-         entry.extend(fields);
+         entry.rest.extend(fields);
       }
-      models.push(Value::Object(entry));
+      catalog.models.push(entry);
    }
    serde_json::to_string(&catalog).ok()
 }
@@ -279,6 +285,14 @@ mod zen_entry_tests {
    use std::collections::BTreeMap;
 
    use super::{ModelsResponse, with_zen_entries};
+   use crate::zen::ZenModel;
+
+   fn zen(id: &str) -> ZenModel {
+      ZenModel {
+         id: id.to_owned(),
+         context_window: None,
+      }
+   }
 
    const CATALOG: &str = r#"{"models":[
       {"slug":"gpt-5.6-sol","visibility":"list","tool_mode":"code_mode_only","apply_patch_tool_type":"freeform",
@@ -291,10 +305,7 @@ mod zen_entry_tests {
 
    #[test]
    fn a_zen_model_inherits_the_template_with_function_tools_only() {
-      let ids = [
-         "muse-spark-1.3-contributor-free".to_owned(),
-         "muse-old".to_owned(),
-      ];
+      let ids = [zen("muse-spark-1.3-contributor-free"), zen("muse-old")];
       let out = with_zen_entries(CATALOG, "gpt-5.6-sol", &ids).unwrap();
       let catalog: serde_json::Value = serde_json::from_str(&out).unwrap();
       let models = catalog["models"].as_array().unwrap();
@@ -381,6 +392,6 @@ mod zen_entry_tests {
    #[test]
    fn a_catalog_without_a_listed_entry_is_left_alone() {
       let raw = r#"{"models":[{"slug":"x","visibility":"hide"}]}"#;
-      assert!(with_zen_entries(raw, "gpt-5.6-sol", &["muse".to_owned()]).is_none());
+      assert!(with_zen_entries(raw, "gpt-5.6-sol", &[zen("muse")]).is_none());
    }
 }

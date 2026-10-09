@@ -2,15 +2,14 @@ use std::mem;
 
 use serde::Deserialize;
 use serde::de::IgnoredAny;
-use serde_json::value::{RawValue, to_raw_value};
+use serde_json::value::RawValue;
 
-use super::{decode_signature, model_map, usable_cap};
 use crate::codex::types::{
-   ContentPart, InputItem, ReasoningConfig, ResponsesRequest, SummaryPart, ToolChoice, ToolDef,
-   ToolOutput,
+   ContentPart, InputItem, ResponsesRequest, SummaryPart, ToolChoice, ToolDef, ToolOutput,
 };
 use crate::config::Config;
 use crate::provider::Provider;
+use crate::translate::{decode_signature, responses_request};
 
 #[derive(Debug, Deserialize)]
 pub struct AnthropicRequest {
@@ -141,6 +140,31 @@ pub enum SystemPrompt {
 pub struct SystemBlock {
    #[serde(default)]
    text: Option<String>,
+   #[serde(default)]
+   cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheControl {
+   #[serde(default)]
+   ttl: Option<String>,
+}
+
+impl AnthropicRequest {
+   /// Anthropic accepts only `5m` and `1h`, and an absent `ttl` means `5m`.
+   pub fn cache_ttl_secs(&self) -> Option<i64> {
+      let Some(SystemPrompt::Blocks(ref blocks)) = self.system else {
+         return None;
+      };
+      blocks
+         .iter()
+         .filter_map(|block| block.cache_control.as_ref())
+         .map(|control| match control.ttl.as_deref() {
+            Some("1h") => 3600,
+            _ => 300,
+         })
+         .max()
+   }
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,14 +205,22 @@ impl AnthropicRequest {
    }
 }
 
-pub fn empty_schema() -> Box<RawValue> {
-   to_raw_value(&serde_json::json!({"type": "object", "properties": {}}))
-      .expect("schema serializes")
-}
-
 pub fn to_responses(req: &AnthropicRequest, cfg: &Config, provider: Provider) -> ResponsesRequest {
-   let resolved = model_map::resolve(&cfg.models, &req.model);
-   let mut out = ResponsesRequest::new(resolved.model.clone(), cfg.codex.instructions());
+   let effort = req.thinking.as_ref().and_then(|thinking| {
+      if !req.thinking_enabled() {
+         return Some("low".to_owned());
+      }
+      thinking.budget_tokens.map(|budget| {
+         if budget < 4096 {
+            "low".to_owned()
+         } else if budget < 0x4000 {
+            "medium".to_owned()
+         } else {
+            "high".to_owned()
+         }
+      })
+   });
+   let mut out = responses_request(cfg, &req.model, effort, req.max_tokens);
    let replay_reasoning = provider == Provider::OpenAi;
 
    if let Some(system) = req.system.as_ref() {
@@ -210,13 +242,11 @@ pub fn to_responses(req: &AnthropicRequest, cfg: &Config, provider: Provider) ->
          let Some(name) = tool.name.as_ref() else {
             continue;
          };
-         out.tools.push(ToolDef {
-            kind: "function".into(),
-            name: name.clone(),
-            description: tool.description.clone(),
-            strict: false,
-            parameters: Some(tool.input_schema.clone().unwrap_or_else(empty_schema)),
-         });
+         out.tools.push(ToolDef::function(
+            name.clone(),
+            tool.description.clone(),
+            tool.input_schema.clone(),
+         ));
       }
    }
 
@@ -230,34 +260,6 @@ pub fn to_responses(req: &AnthropicRequest, cfg: &Config, provider: Provider) ->
       if tool_choice.disable_parallel_tool_use == Some(true) {
          out.parallel_tool_calls = Some(false);
       }
-   }
-
-   let effort = req
-      .thinking
-      .as_ref()
-      .and_then(|thinking| {
-         if !req.thinking_enabled() {
-            return Some("low".to_owned());
-         }
-         thinking.budget_tokens.map(|budget| {
-            if budget < 4096 {
-               "low".to_owned()
-            } else if budget < 0x4000 {
-               "medium".to_owned()
-            } else {
-               "high".to_owned()
-            }
-         })
-      })
-      .or(resolved.effort)
-      .unwrap_or_else(|| "medium".into());
-   out.reasoning = Some(ReasoningConfig {
-      effort: model_map::clamp_effort(&out.model, &effort),
-      summary: "auto".into(),
-   });
-
-   if cfg.codex.forward_max_tokens {
-      out.max_output_tokens = usable_cap(req.max_tokens);
    }
 
    out
@@ -357,9 +359,6 @@ fn convert_message(msg: &AnthMessage, out: &mut Vec<InputItem>, replay_reasoning
                continue;
             };
             let (id, encrypted_content) = decode_signature(sig);
-            if encrypted_content.is_none() {
-               continue;
-            }
             flush(&mut parts, out);
             out.push(InputItem::Reasoning {
                id,
@@ -370,7 +369,7 @@ fn convert_message(msg: &AnthMessage, out: &mut Vec<InputItem>, replay_reasoning
                      text: thinking.clone(),
                   }]
                },
-               encrypted_content,
+               encrypted_content: Some(encrypted_content),
             });
          },
          ContentBlock::RedactedThinking => {},
@@ -389,8 +388,8 @@ fn tool_result_text(content: Option<&ToolResultContent>) -> String {
       Some(&ToolResultContent::Blocks(ref blocks)) => blocks
          .iter()
          .filter_map(|block| match *block {
-            ToolResultBlock::Text { ref text } => Some(text.clone()),
-            ToolResultBlock::Image => Some("[image omitted]".into()),
+            ToolResultBlock::Text { ref text } => Some(text.as_str()),
+            ToolResultBlock::Image => Some("[image omitted]"),
             ToolResultBlock::Other => None,
          })
          .collect::<Vec<_>>()
@@ -412,15 +411,25 @@ mod tests {
    }
 
    #[test]
+   fn fast_model_uses_priority_service_tier() {
+      let mut req = parse(&serde_json::json!("hi")).unwrap();
+      req.model = "gpt-test-fast".into();
+
+      let translated = to_responses(&req, &Config::default(), Provider::OpenAi);
+      assert_eq!(translated.model, "gpt-test");
+      assert_eq!(translated.service_tier.as_deref(), Some("priority"));
+   }
+
+   #[test]
    fn a_cap_below_the_upstream_floor_is_not_forwarded() {
       let mut req = parse(&serde_json::json!("hi")).unwrap();
 
       req.max_tokens = Some(8);
-      let dropped = to_responses(&req, &Config::for_tests(), Provider::OpenAi);
+      let dropped = to_responses(&req, &Config::default(), Provider::OpenAi);
       assert_eq!(dropped.max_output_tokens, None);
 
       req.max_tokens = Some(4096);
-      let kept = to_responses(&req, &Config::for_tests(), Provider::OpenAi);
+      let kept = to_responses(&req, &Config::default(), Provider::OpenAi);
       assert_eq!(kept.max_output_tokens, Some(4096));
    }
 

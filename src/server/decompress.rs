@@ -1,9 +1,12 @@
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::Request;
 use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use ruzstd::decoding::StreamingDecoder;
+
+use crate::server::error::{Dialect, error_response};
 
 /// Codex zstd-encodes request bodies whenever it talks to the built-in
 /// `openai` provider, and a turn's context is mostly repeated text, so the
@@ -22,13 +25,16 @@ pub async fn zstd_requests(req: Request, next: Next) -> Response {
    }
 
    let (mut parts, body) = req.into_parts();
-   let Ok(bytes) = to_bytes(body, MAX_BODY).await else {
-      return super::error::error_response(
-         super::error::Dialect::OpenAi,
-         413,
+   let too_large = || {
+      error_response(
+         Dialect::OpenAi,
+         StatusCode::PAYLOAD_TOO_LARGE,
          "invalid_request_error",
          "request body too large",
-      );
+      )
+   };
+   let Ok(bytes) = to_bytes(body, MAX_BODY).await else {
+      return too_large();
    };
    let plain = match decode(&bytes, MAX_BODY) {
       Ok(plain) => plain,
@@ -37,17 +43,12 @@ pub async fn zstd_requests(req: Request, next: Next) -> Response {
             "rejecting a body that unpacks past {MAX_BODY} bytes from {} compressed",
             bytes.len()
          );
-         return super::error::error_response(
-            super::error::Dialect::OpenAi,
-            413,
-            "invalid_request_error",
-            "request body too large",
-         );
+         return too_large();
       },
       Err(DecodeError::Malformed) => {
-         return super::error::error_response(
-            super::error::Dialect::OpenAi,
-            400,
+         return error_response(
+            Dialect::OpenAi,
+            StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "malformed zstd request body",
          );
@@ -57,7 +58,7 @@ pub async fn zstd_requests(req: Request, next: Next) -> Response {
    parts.headers.remove(CONTENT_ENCODING);
    parts
       .headers
-      .insert(CONTENT_LENGTH, plain.len().to_string().parse().unwrap());
+      .insert(CONTENT_LENGTH, HeaderValue::from(plain.len()));
    next
       .run(Request::from_parts(parts, Body::from(plain)))
       .await

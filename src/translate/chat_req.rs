@@ -1,17 +1,24 @@
 use std::collections::BTreeSet;
+use std::io::Cursor;
 
+use data_encoding::BASE64;
+use image_webp::WebPDecoder;
+use png::{BitDepth, ColorType, Encoder};
 use serde::Serialize;
-use serde_json::value::{RawValue, to_raw_value};
+use serde_json::value::RawValue;
 
-use super::anthropic_req::empty_schema;
-use super::chat::{
+use crate::codex::types::{ContentPart, InputItem, ResponsesRequest, ToolChoice, ToolDef};
+use crate::gemini::signatures;
+use crate::translate::chat::{
    ChatContent, ChatMessage, ChatPart, ChatRequest, ChatToolCall, ChatToolChoice, ChatToolDef,
    ExtraContent, FunctionBody, FunctionDef, ImageRef, StreamOptions,
 };
-use crate::codex::types::{ContentPart, InputItem, ResponsesRequest, ToolChoice, ToolDef};
-use crate::gemini::signatures;
+use crate::translate::empty_schema;
 
-fn tool_call_message(call_id: &str, name: &str, arguments: String) -> ChatMessage {
+/// One assistant turn becomes one message. Strict backends (zen's Console
+/// upstream) 400 an assistant tool call that is not followed by its result,
+/// and omp sends parallel calls and their narration as separate items.
+fn push_tool_call(messages: &mut Vec<ChatMessage>, call_id: &str, name: &str, arguments: String) {
    let call = ChatToolCall {
       id: Some(call_id.to_owned()),
       kind: Some("function".into()),
@@ -24,11 +31,19 @@ fn tool_call_message(call_id: &str, name: &str, arguments: String) -> ChatMessag
          .map(ExtraContent::with_signature),
       ..Default::default()
    };
-   ChatMessage {
+
+   if let Some(last) = messages.last_mut()
+      && last.role == "assistant"
+   {
+      last.tool_calls.get_or_insert_default().push(call);
+      return;
+   }
+
+   messages.push(ChatMessage {
       role: "assistant".into(),
       tool_calls: Some(vec![call]),
       ..Default::default()
-   }
+   });
 }
 
 /// Codex's shell tool is a grammar-constrained freeform tool taking raw text.
@@ -59,21 +74,17 @@ fn request_tools(req: &ResponsesRequest) -> impl Iterator<Item = &ToolDef> {
    )
 }
 
-/// The single argument a custom tool is presented as taking.
-pub(super) const FREEFORM_ARG: &str = "input";
+pub const FREEFORM_ARG: &str = "input";
 
 #[derive(Serialize)]
 struct Freeform<'a> {
    input: &'a str,
 }
 
+const FREEFORM_SCHEMA: &str = r#"{"properties":{"input":{"description":"The complete tool input, verbatim.","type":"string"}},"required":["input"],"type":"object"}"#;
+
 fn freeform_schema() -> Box<RawValue> {
-   to_raw_value(&serde_json::json!({
-      "type": "object",
-      "properties": {"input": {"type": "string", "description": "The complete tool input, verbatim."}},
-      "required": ["input"],
-   }))
-   .expect("schema serializes")
+   RawValue::from_string(FREEFORM_SCHEMA.to_owned()).expect("schema is valid JSON")
 }
 
 pub fn to_chat(req: &ResponsesRequest) -> ChatRequest {
@@ -87,8 +98,23 @@ pub fn to_chat(req: &ResponsesRequest) -> ChatRequest {
          InputItem::Message {
             ref role,
             ref content,
+         } if role == "assistant"
+            && let Some(last) = messages.last_mut()
+            && last.role == "assistant"
+            && last.content.is_none() =>
+         {
+            last.content = Some(parts(content));
+         },
+         InputItem::Message {
+            ref role,
+            ref content,
          } => messages.push(ChatMessage {
-            role: chat_role(role).to_owned(),
+            // Chat completions has no `developer` role.
+            role: match role.as_str() {
+               "developer" => "system",
+               other => other,
+            }
+            .to_owned(),
             content: Some(parts(content)),
             ..Default::default()
          }),
@@ -96,7 +122,7 @@ pub fn to_chat(req: &ResponsesRequest) -> ChatRequest {
             ref call_id,
             ref name,
             ref arguments,
-         } => messages.push(tool_call_message(call_id, name, arguments.clone())),
+         } => push_tool_call(&mut messages, call_id, name, arguments.clone()),
          InputItem::FunctionCallOutput {
             ref call_id,
             ref output,
@@ -114,11 +140,12 @@ pub fn to_chat(req: &ResponsesRequest) -> ChatRequest {
             ref call_id,
             ref name,
             ref input,
-         } => messages.push(tool_call_message(
+         } => push_tool_call(
+            &mut messages,
             call_id,
             name,
             serde_json::to_string(&Freeform { input }).unwrap_or_default(),
-         )),
+         ),
          // Gemini rejects an unknown role rather than ignoring it.
          InputItem::Reasoning { .. } | InputItem::AdditionalTools { .. } | InputItem::Other => {},
       }
@@ -155,7 +182,7 @@ pub fn to_chat(req: &ResponsesRequest) -> ChatRequest {
          .reasoning
          .as_ref()
          .filter(|reasoning| !reasoning.effort.is_empty())
-         .map(|reasoning| gemini_effort(&reasoning.effort).to_owned()),
+         .map(|reasoning| clamped_effort(&req.model, &reasoning.effort).to_owned()),
       tools: (!tools.is_empty()).then_some(tools),
       tool_choice: req.tool_choice.as_ref().map(|choice| match *choice {
          ToolChoice::Mode(ref mode) => ChatToolChoice::Mode(mode.clone()),
@@ -165,9 +192,17 @@ pub fn to_chat(req: &ResponsesRequest) -> ChatRequest {
    }
 }
 
-/// Gemini takes none, low, medium or high and rejects anything else outright,
-/// so codex asking for xhigh would 400 the whole turn.
-pub fn gemini_effort(effort: &str) -> &str {
+/// Gemini and zen both take none, low, medium or high and reject anything
+/// else outright, so codex asking for xhigh would kill the whole turn.
+/// fledge is the exception and 400s anything outside low, high or max.
+pub fn clamped_effort<'effort>(model: &str, effort: &'effort str) -> &'effort str {
+   if model.starts_with("fledge") {
+      return match effort {
+         "none" | "minimal" | "low" => "low",
+         "medium" | "high" => "high",
+         _ => "max",
+      };
+   }
    match effort {
       "none" | "minimal" => "none",
       "low" => "low",
@@ -176,12 +211,56 @@ pub fn gemini_effort(effort: &str) -> &str {
    }
 }
 
-/// Chat completions has no `developer` role.
-fn chat_role(role: &str) -> &str {
-   match role {
-      "developer" => "system",
-      other => other,
+#[derive(Debug, thiserror::Error)]
+enum TranscodeError {
+   #[error("base64")]
+   Base64(#[source] data_encoding::DecodeError),
+   #[error("webp decode")]
+   Decode(#[source] image_webp::DecodingError),
+   #[error("png encode")]
+   Encode(#[source] png::EncodingError),
+}
+
+/// Zen's image sandbox 415s anything but PNG or JPEG.
+fn accepted_image(url: &str) -> String {
+   let Some(data) = url.strip_prefix("data:image/webp;base64,") else {
+      return url.to_owned();
+   };
+   match webp_to_png(data) {
+      Ok(png) => format!("data:image/png;base64,{png}"),
+      Err(error) => {
+         tracing::warn!(%error, "transcoding a webp image failed, sending it as is");
+         url.to_owned()
+      },
    }
+}
+
+fn webp_to_png(data: &str) -> Result<String, TranscodeError> {
+   let bytes = BASE64
+      .decode(data.as_bytes())
+      .map_err(TranscodeError::Base64)?;
+   let mut decoder = WebPDecoder::new(Cursor::new(bytes)).map_err(TranscodeError::Decode)?;
+   let (width, height) = decoder.dimensions();
+   let color = if decoder.has_alpha() {
+      ColorType::Rgba
+   } else {
+      ColorType::Rgb
+   };
+   let mut pixels = vec![0; decoder.output_buffer_size().unwrap_or_default()];
+   decoder
+      .read_image(&mut pixels)
+      .map_err(TranscodeError::Decode)?;
+
+   let mut out = Vec::new();
+   let mut encoder = Encoder::new(&mut out, width, height);
+   encoder.set_color(color);
+   encoder.set_depth(BitDepth::Eight);
+   let mut writer = encoder.write_header().map_err(TranscodeError::Encode)?;
+   writer
+      .write_image_data(&pixels)
+      .map_err(TranscodeError::Encode)?;
+   writer.finish().map_err(TranscodeError::Encode)?;
+   Ok(BASE64.encode(&out))
 }
 
 fn parts(content: &[ContentPart]) -> ChatContent {
@@ -190,7 +269,9 @@ fn parts(content: &[ContentPart]) -> ChatContent {
          .iter()
          .map(|part| match part {
             &ContentPart::InputImage { ref image_url } => ChatPart::ImageUrl {
-               image_url: ImageRef::Url(image_url.clone()),
+               image_url: ImageRef::Object {
+                  url: accepted_image(image_url),
+               },
             },
             &ContentPart::InputText { ref text } | &ContentPart::OutputText { ref text } => {
                ChatPart::Text { text: text.clone() }

@@ -15,55 +15,28 @@ async fn spawn_proxy_with_codex_status(status: StatusCode) -> (String, Db) {
       axum::serve(upstream_listener, app).await.unwrap();
    });
    let base_url = format!("http://{upstream_addr}");
-   let db_path = env::temp_dir().join(format!("slop-test-{}.db", uuid::Uuid::new_v4()));
-   let db = Db::open(&db_path).unwrap();
-   db.create_token("alice", "sp-test", "sp-test")
-      .await
-      .unwrap();
-   db.upsert_account(NewAccount {
+   let tokens = fresh_tokens();
+   let accounts = [NewAccount {
       provider: Provider::OpenAi,
       id: "acct-1",
       email: Some("test@example.com"),
       label: None,
       plan: Some("plus"),
-      tokens: &fresh_tokens(),
+      tokens: &tokens,
       auth_mode: AuthMode::OAuth,
-   })
-   .await
-   .unwrap();
-   let cfg_db_path = db_path.clone();
+   }];
    let cfg = Config {
-      db_path,
-      bind: String::new(),
-      metrics_bind: None,
       codex: CodexConfig {
          base_url,
          ..CodexConfig::default()
       },
-      anthropic: AnthropicConfig::default(),
-      gemini: GeminiConfig::default(),
-      zen: ZenConfig::default(),
-      glm: GlmConfig::default(),
-      experiential: ExperientialConfig::default(),
-      pricing: PricingConfig::default(),
       models: ModelsConfig {
          anthropic_patterns: Vec::new(),
          ..ModelsConfig::default()
       },
+      ..Config::default()
    };
-   let pools = Pools::load(&db, &cfg).await.unwrap();
-   let state = AppState(Arc::new(Inner {
-      db: db.clone(),
-      cfg,
-      prices: Prices::new(&cfg_db_path, PricingConfig::default().url),
-      pools,
-   }));
-   let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-   let proxy_addr = proxy_listener.local_addr().unwrap();
-   tokio::spawn(async move {
-      axum::serve(proxy_listener, router(state)).await.unwrap();
-   });
-   (format!("http://{proxy_addr}"), db)
+   serve_proxy(cfg, &accounts).await
 }
 
 #[tokio::test]
@@ -85,6 +58,7 @@ async fn retry_after_on_request_limit_for_both_dialects() {
          five_hour_limit: None,
          weekly_limit: None,
          pinned_account: None,
+         reserved_only: false,
       },
    )
    .await
@@ -178,6 +152,7 @@ async fn retry_after_on_token_limit() {
          five_hour_limit: None,
          weekly_limit: None,
          pinned_account: None,
+         reserved_only: false,
       },
    )
    .await
@@ -313,6 +288,7 @@ async fn rate_limit_headers_present_on_success() {
          five_hour_limit: None,
          weekly_limit: None,
          pinned_account: None,
+         reserved_only: false,
       },
    )
    .await
@@ -380,9 +356,21 @@ async fn estimated_usd_budget_returns_429_before_upstream() {
       .await
       .unwrap();
    assert_eq!(response.status(), 429);
-   assert!(response.headers()["retry-after"].to_str().unwrap().parse::<i64>().unwrap() >= 60);
+   assert!(
+      response.headers()["retry-after"]
+         .to_str()
+         .unwrap()
+         .parse::<i64>()
+         .unwrap()
+         >= 60
+   );
    let body: serde_json::Value = response.json().await.unwrap();
-   assert!(body["error"]["message"].as_str().unwrap().contains("estimated USD budget"));
+   assert!(
+      body["error"]["message"]
+         .as_str()
+         .unwrap()
+         .contains("estimated USD budget")
+   );
 }
 
 #[tokio::test]

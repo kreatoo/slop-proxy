@@ -5,9 +5,9 @@ use rand::RngCore as _;
 use reqwest::Url;
 use serde::Deserialize;
 
-use super::TokenSet;
-use super::refresh::{RefreshError, RefreshRequest, post_token, token_set};
 use crate::db::Db;
+use crate::oauth::refresh::TokenResponse;
+use crate::oauth::{finish_login, http, ok_json};
 use crate::provider::Provider;
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -62,7 +62,7 @@ pub async fn login(db: &Db, label: Option<String>) -> Result<()> {
       bail!("state mismatch, paste the whole code");
    }
 
-   let resp = super::http()
+   let resp = http()
       .post(TOKEN_URL)
       .json(&ExchangeRequest {
          grant_type: "authorization_code",
@@ -75,19 +75,19 @@ pub async fn login(db: &Db, label: Option<String>) -> Result<()> {
       .send()
       .await
       .wrap_err("token exchange request failed")?;
-   let parsed = super::exchanged(resp).await?;
+   let mut parsed: TokenResponse = ok_json(resp, "token exchange").await?;
 
-   let account = parsed.account.as_ref();
+   let account = parsed.account.take().unwrap_or_default();
    let account_id = account
-      .and_then(|acct| acct.uuid.clone())
+      .uuid
       .ok_or_else(|| eyre!("token response has no account uuid"))?;
-   let email = account.and_then(|acct| acct.email_address.clone());
+   let email = account.email_address;
    let plan = subscription_tier(&parsed.access_token).await;
    let tokens = parsed
       .into_token_set(None)
       .ok_or_else(|| eyre!("no refresh_token in token response"))?;
 
-   super::finish_login(
+   finish_login(
       db,
       Provider::Anthropic,
       &account_id,
@@ -110,7 +110,7 @@ async fn subscription_tier(access_token: &str) -> Option<String> {
    struct Org {
       rate_limit_tier: Option<String>,
    }
-   super::http()
+   http()
       .get(PROFILE_URL)
       .bearer_auth(access_token)
       .header("anthropic-beta", "oauth-2025-04-20")
@@ -122,17 +122,4 @@ async fn subscription_tier(access_token: &str) -> Option<String> {
       .ok()?
       .organization?
       .rate_limit_tier
-}
-
-pub async fn refresh(refresh_token: &str) -> Result<TokenSet, RefreshError> {
-   let (status, body) = post_token(
-      TOKEN_URL,
-      &RefreshRequest {
-         client_id: CLIENT_ID,
-         grant_type: "refresh_token",
-         refresh_token,
-      },
-   )
-   .await?;
-   token_set(status, &body, Some(refresh_token))
 }

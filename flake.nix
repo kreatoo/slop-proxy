@@ -87,8 +87,8 @@
 
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.system}.default;
-              defaultText = lib.literalExpression "slop-proxy.packages.\${pkgs.system}.default";
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "slop-proxy.packages.\${pkgs.stdenv.hostPlatform.system}.default";
               description = "slop-proxy package to run.";
             };
 
@@ -131,6 +131,7 @@
                 ExecStart = "${lib.getExe cfg.package} --db /var/lib/slop-proxy/slop.db --config ${configFile} serve --bind ${cfg.bind}";
                 Restart = "on-failure";
                 RestartSec = 5;
+                LimitNOFILE = 65536;
                 NoNewPrivileges = true;
                 ProtectSystem = "strict";
                 ProtectHome = true;

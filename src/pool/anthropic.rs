@@ -1,12 +1,10 @@
 use axum::body::Bytes;
 
-use super::{
-   AccountUsage, AuthPolicy, Backend, Cooldown, ModelWindow, Pool, PoolError, Route, Slot,
-   UsageWindow,
+use crate::anthropic::{AnthropicClient, Model, RelayHeaders};
+use crate::pool::{
+   AccountUsage, AuthPolicy, Backend, Cooldown, ModelWindow, Pool, Route, Slot, UsageWindow,
 };
-use crate::anthropic::client::{AnthropicClient, RelayHeaders};
 use crate::provider::Provider;
-use crate::translate::chat::ChatError;
 use crate::upstream::SendError;
 
 /// Session-sticky pool over Anthropic Max accounts, owning the relay client.
@@ -29,10 +27,6 @@ impl Backend for AnthropicClient {
    type Request = Relay;
    type Response = reqwest::Response;
 
-   fn reason(body: String) -> String {
-      ChatError::reason(body)
-   }
-
    fn soft_limit(&self) -> f64 {
       self.soft_utilization_limit()
    }
@@ -40,28 +34,28 @@ impl Backend for AnthropicClient {
    async fn send(
       &self,
       token: &str,
-      _slot: &Slot,
+      slot: &Slot,
       _route: Route<'_>,
       req: &Self::Request,
    ) -> Result<Self::Response, SendError> {
-      Self::post(self, token, req.path, &req.body, &req.hdrs).await
+      Self::post(
+         self,
+         token,
+         slot.auth_mode,
+         slot.egress,
+         req.path,
+         &req.body,
+         &req.hdrs,
+      )
+      .await
    }
 }
 
 impl Pool<AnthropicClient> {
-   /// The catalog body untouched, for relaying to an Anthropic client.
-   pub async fn models_raw(&self) -> Result<String, PoolError> {
-      for slot in self.slots.list().await {
-         let Ok(token) = self.slots.fresh_token(&slot, false).await else {
-            continue;
-         };
-         match self.backend.models_raw(&token).await {
-            Ok((status, body)) if status.is_success() => return Ok(body),
-            Ok((status, _)) => tracing::debug!("models for {}: {status}", slot.display),
-            Err(err) => tracing::debug!("models for {}: {err}", slot.display),
-         }
-      }
-      Err(PoolError::NoAccounts(Provider::Anthropic))
+   pub async fn catalog(&self) -> Option<Vec<Model>> {
+      self
+         .first_answer(async |backend, token, _| backend.models(token).await)
+         .await
    }
 
    /// Reads each account's rolling-window consumption from the provider.
@@ -69,27 +63,18 @@ impl Pool<AnthropicClient> {
    /// and a locked account is known before it rejects traffic.
    pub async fn poll_usage(&self) {
       for slot in self.slots.list().await {
+         if !slot.auth_mode.refreshable() || self.slots.is_disabled(&slot).await {
+            continue;
+         }
          let Ok(token) = self.slots.fresh_token(&slot, false).await else {
             continue;
          };
          match self.backend.usage(&token).await {
             Ok(usage) => {
-               match self
+               self
                   .slots
                   .clear_cooldown_if(&slot, |until| usage.cooldown_is_obsolete(until))
-                  .await
-               {
-                  Ok(true) => tracing::info!(
-                     account = %slot.display,
-                     "cleared cooldown for an inactive Anthropic quota window"
-                  ),
-                  Ok(false) => {},
-                  Err(err) => tracing::warn!(
-                     account = %slot.display,
-                     error = %err,
-                     "failed to clear obsolete Anthropic cooldown"
-                  ),
-               }
+                  .await;
                let windows = usage
                   .windows()
                   .map(|(name, window)| UsageWindow {
@@ -117,7 +102,7 @@ impl Pool<AnthropicClient> {
                            })
                            .collect(),
                         locked: usage.locked(),
-                        observed_at: 0,
+                        ..AccountUsage::default()
                      },
                   )
                   .await;
@@ -151,7 +136,7 @@ mod tests {
       let db = Db::open(&db_path).unwrap();
       AnthropicPool {
          slots: super::super::test_slots(db, Provider::Anthropic, ids),
-         backend: AnthropicClient::new(AnthropicConfig::default()),
+         backend: AnthropicClient::new(AnthropicConfig::default()).unwrap(),
          bound: Mutex::new(HashMap::new()),
       }
    }
@@ -165,8 +150,9 @@ mod tests {
             user: "",
             pinned_account: None,
             prefer_trusted: false,
-      five_hour_limit: None,
-      weekly_limit: None,
+            reserved_only: false,
+            five_hour_limit: None,
+            weekly_limit: None,
          })
          .await
    }
@@ -215,9 +201,7 @@ mod tests {
                      utilization: used,
                      resets_at: Some(hours(resets_in)),
                   }],
-                  model_windows: Vec::new(),
-                  locked: false,
-                  observed_at: 0,
+                  ..AccountUsage::default()
                },
             )
             .await;
@@ -241,14 +225,12 @@ mod tests {
          .note_usage(
             &head,
             AccountUsage {
-               model_windows: Vec::new(),
                windows: vec![UsageWindow {
                   name: "5h".into(),
                   utilization: 0.97,
                   resets_at: None,
                }],
-               locked: false,
-               observed_at: 0,
+               ..AccountUsage::default()
             },
          )
          .await;
@@ -262,14 +244,13 @@ mod tests {
          .note_usage(
             &fresh,
             AccountUsage {
-               model_windows: Vec::new(),
                windows: vec![UsageWindow {
                   name: "5h".into(),
                   utilization: 0.01,
                   resets_at: None,
                }],
                locked: true,
-               observed_at: 0,
+               ..AccountUsage::default()
             },
          )
          .await;
@@ -330,7 +311,8 @@ mod tests {
          AnthropicClient::new(AnthropicConfig {
             base_url: format!("http://{addr}"),
             ..AnthropicConfig::default()
-         }),
+         })
+         .unwrap(),
       )
       .await
       .unwrap();
@@ -339,9 +321,8 @@ mod tests {
 
       let snapshots = pool.slots.snapshot().await;
       let reported = snapshots[0].usage.as_ref().unwrap();
-      assert_eq!(reported.windows.len(), 1);
-      assert_eq!(reported.windows[0].name, "5h");
-      assert!((reported.peak() - 0.26_f64).abs() < f64::EPSILON);
+      assert_eq!(reported.windows.len(), 2);
+      assert!((reported.peak() - 0.99_f64).abs() < f64::EPSILON);
       let models: Vec<_> = reported
          .model_windows
          .iter()
@@ -429,13 +410,13 @@ mod tests {
          base_url: format!("http://{addr}"),
          ..AnthropicConfig::default()
       };
-      let pool = AnthropicPool::load(db.clone(), AnthropicClient::new(config.clone()))
+      let pool = AnthropicPool::load(db.clone(), AnthropicClient::new(config.clone()).unwrap())
          .await
          .unwrap();
       pool.poll_usage().await;
       server.abort();
 
-      let reloaded = AnthropicPool::load(db.clone(), AnthropicClient::new(config))
+      let reloaded = AnthropicPool::load(db.clone(), AnthropicClient::new(config).unwrap())
          .await
          .unwrap();
       for checked in [&pool, &reloaded] {

@@ -4,14 +4,17 @@ use std::fs;
 use std::path::PathBuf;
 
 use eyre::{Result, WrapErr as _};
+use ipnet::Ipv6Net;
 
 use crate::cli::Cli;
 use crate::provider::Provider;
 
 pub const DEFAULT_INSTRUCTIONS: &str = "You are Codex, based on GPT-5. You are running as a coding agent on a user's computer. Answer the user's requests directly and concisely.";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
 pub struct Config {
+   #[serde(rename = "db")]
    pub db_path: PathBuf,
    pub bind: String,
    /// Extra unauthenticated listener serving GET /metrics when set.
@@ -20,8 +23,10 @@ pub struct Config {
    pub anthropic: AnthropicConfig,
    pub gemini: GeminiConfig,
    pub zen: ZenConfig,
-   pub glm: GlmConfig,
-   pub experiential: ExperientialConfig,
+   pub glm: RelayConfig,
+   pub deepseek: RelayConfig,
+   pub experiential: RelayConfig,
+   pub copilot: CopilotConfig,
    pub pricing: PricingConfig,
    pub models: ModelsConfig,
 }
@@ -35,6 +40,8 @@ pub struct GeminiConfig {
    pub headers: BTreeMap<String, String>,
    pub soft_utilization_limit: f64,
    pub retry_budget_secs: u64,
+   #[serde(flatten)]
+   pub egress: EgressConfig,
 }
 
 impl Default for GeminiConfig {
@@ -44,6 +51,7 @@ impl Default for GeminiConfig {
          headers: BTreeMap::new(),
          soft_utilization_limit: 0.9,
          retry_budget_secs: 90,
+         egress: EgressConfig::default(),
       }
    }
 }
@@ -51,8 +59,6 @@ impl Default for GeminiConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct PricingConfig {
-   /// `LiteLLM` lands price additions on a staging branch and promotes them to
-   /// main on a release cut, so a day-0 model is priced there first.
    pub url: String,
 }
 
@@ -66,56 +72,40 @@ impl Default for PricingConfig {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
-pub struct ExperientialConfig {
+pub struct CopilotConfig {
    pub base_url: String,
+   /// Fraction of a rolling window past which an account is ranked behind
+   /// its peers, so sessions migrate before the window rejects them.
+   pub soft_utilization_limit: f64,
 }
 
-impl Default for ExperientialConfig {
+impl Default for CopilotConfig {
    fn default() -> Self {
       Self {
-         base_url: "https://api.experientiallabs.ai".into(),
+         base_url: "https://api.githubcopilot.com".into(),
+         soft_utilization_limit: 0.9,
       }
    }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Outbound proxies for one provider. Flattened into each provider's own
+/// table, so the keys sit beside `base_url` rather than under a subtable.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
-pub struct GlmConfig {
-   pub base_url: String,
-}
-
-impl Default for GlmConfig {
-   fn default() -> Self {
-      Self {
-         base_url: "https://api.z.ai/api/anthropic".into(),
-      }
-   }
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default)]
-pub struct ZenConfig {
-   pub base_url: String,
+pub struct EgressConfig {
    pub proxy_urls: Vec<String>,
    pub proxy_urls_file: Option<PathBuf>,
+   /// Zen's free tier counts a whole /48 as one client, so each prefix here
+   /// is one allowance and requests alternate between them.
+   pub source_prefixes: Vec<Ipv6Net>,
 }
 
-impl Default for ZenConfig {
-   fn default() -> Self {
-      Self {
-         base_url: "https://opencode.ai/zen/v1".into(),
-         proxy_urls: Vec::new(),
-         proxy_urls_file: None,
-      }
-   }
-}
-
-impl ZenConfig {
-   pub fn proxy_urls(&self) -> Result<Vec<String>> {
+impl EgressConfig {
+   pub fn urls(&self) -> Result<Vec<String>> {
       let mut urls = self.proxy_urls.clone();
       if let Some(path) = self.proxy_urls_file.as_ref() {
          let contents = fs::read_to_string(path)
-            .wrap_err_with(|| format!("reading zen proxy list {}", path.display()))?;
+            .wrap_err_with(|| format!("reading proxy list {}", path.display()))?;
          urls.extend(
             contents
                .lines()
@@ -125,6 +115,49 @@ impl ZenConfig {
          );
       }
       Ok(urls)
+   }
+}
+
+/// Z.ai, `DeepSeek` and Experiential all relay verbatim and differ only in the
+/// URL, which each client falls back to when `base_url` is unset.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct RelayConfig {
+   pub base_url: Option<String>,
+   #[serde(flatten)]
+   pub egress: EgressConfig,
+}
+
+impl RelayConfig {
+   pub fn base_url_or<'a>(&'a self, default: &'a str) -> &'a str {
+      self
+         .base_url
+         .as_deref()
+         .unwrap_or(default)
+         .trim_end_matches('/')
+   }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct ZenConfig {
+   pub base_url: String,
+   /// Zen's own `/models` names ids and nothing else. models.dev publishes
+   /// zen as its `opencode` provider, which is where opencode reads limits.
+   pub models_dev_url: String,
+   pub user_agent: String,
+   #[serde(flatten)]
+   pub egress: EgressConfig,
+}
+
+impl Default for ZenConfig {
+   fn default() -> Self {
+      Self {
+         base_url: "https://opencode.ai/zen/v1".into(),
+         models_dev_url: "https://models.dev/api.json".into(),
+         user_agent: "opencode/1.18.31 ai-sdk/provider-utils/4.0.46 runtime/bun/1.3.13".into(),
+         egress: EgressConfig::default(),
+      }
    }
 }
 
@@ -139,6 +172,11 @@ pub struct AnthropicConfig {
    /// Fraction of a rolling window past which an account is ranked behind
    /// its peers, so sessions migrate before the window rejects them.
    pub soft_utilization_limit: f64,
+   /// Proxies an account marked with `accounts egress` leaves through, so a
+   /// paid key can be dialled from a chosen address while the pooled seats
+   /// stay direct.
+   #[serde(flatten)]
+   pub egress: EgressConfig,
 }
 
 impl Default for AnthropicConfig {
@@ -147,6 +185,7 @@ impl Default for AnthropicConfig {
          base_url: "https://api.anthropic.com".into(),
          require_claude_code: true,
          soft_utilization_limit: 0.9,
+         egress: EgressConfig::default(),
       }
    }
 }
@@ -163,6 +202,9 @@ pub struct CodexConfig {
    pub instructions: Option<String>,
    pub instructions_file: Option<PathBuf>,
    pub forward_max_tokens: bool,
+   /// Dials with the cleanest `x-codex-turn-state` an account has produced,
+   /// and off means the caller's token always goes out.
+   pub pin_turn_state: bool,
    /// Fraction of a rolling window past which an account is ranked behind
    /// its peers, so traffic moves before the window rejects it.
    pub soft_utilization_limit: f64,
@@ -178,6 +220,7 @@ impl Default for CodexConfig {
          instructions: None,
          instructions_file: None,
          forward_max_tokens: true,
+         pin_turn_state: true,
          soft_utilization_limit: 0.9,
       }
    }
@@ -211,11 +254,24 @@ pub struct ModelsConfig {
    pub gemini_patterns: Vec<String>,
    /// Model patterns served by `OpenCode` Zen.
    pub zen_patterns: Vec<String>,
+   /// Zen models answered on its messages endpoint instead of its responses
+   /// one. Also routes to zen, so a name belongs in one list or the other.
+   pub zen_messages_patterns: Vec<String>,
+   /// Zen models answered on its chat completions endpoint, which are
+   /// bridged both ways rather than relayed.
+   pub zen_chat_patterns: Vec<String>,
    /// Model patterns served by Z.ai's anthropic-compatible endpoint.
    pub glm_patterns: Vec<String>,
+   /// Model patterns served by `DeepSeek`'s anthropic-compatible endpoint.
+   pub deepseek_patterns: Vec<String>,
    /// Model patterns relayed verbatim to the Experiential gateway over
    /// /v1/messages only. Empty by default, set to opt in.
    pub experiential_patterns: Vec<String>,
+   /// Model patterns served by GitHub Copilot's chat-completions endpoint.
+   /// Empty by default, set to opt in.
+   pub copilot_patterns: Vec<String>,
+   /// Model patterns refused on every surface, whichever backend serves them.
+   pub blocked_patterns: Vec<String>,
 }
 
 impl Default for ModelsConfig {
@@ -228,13 +284,29 @@ impl Default for ModelsConfig {
          anthropic_patterns: vec!["claude-*".into()],
          gemini_patterns: vec!["gemini-*".into()],
          zen_patterns: Vec::new(),
+         zen_messages_patterns: Vec::new(),
+         zen_chat_patterns: Vec::new(),
          glm_patterns: vec!["glm-*".into()],
+         deepseek_patterns: vec!["deepseek-*".into()],
          experiential_patterns: Vec::new(),
+         copilot_patterns: Vec::new(),
+         blocked_patterns: Vec::new(),
       }
    }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZenDialect {
+   Responses,
+   Messages,
+   Chat,
+}
+
 impl ModelsConfig {
+   pub fn blocked(&self, model: &str) -> bool {
+      best_match(&self.blocked_patterns, model).is_some()
+   }
+
    /// Which backend serves this model. The most specific pattern wins, and a
    /// tie goes to whichever backend is listed first here.
    pub fn route(&self, model: &str) -> Provider {
@@ -245,11 +317,7 @@ impl ModelsConfig {
    pub fn matched(&self, model: &str) -> Option<Provider> {
       let mut best = Option::<(usize, Provider)>::None;
       for (provider, patterns) in self.sets() {
-         let Some(score) = patterns
-            .iter()
-            .filter_map(|pattern| pattern_specificity(pattern, model))
-            .max()
-         else {
+         let Some(score) = best_match(patterns, model) else {
             continue;
          };
          if best.is_none_or(|(seen, _)| score > seen) {
@@ -259,14 +327,38 @@ impl ModelsConfig {
       best.map(|(_, provider)| provider)
    }
 
-   const fn sets(&self) -> [(Provider, &Vec<String>); 5] {
+   const fn sets(&self) -> [(Provider, &Vec<String>); 9] {
       [
          (Provider::Anthropic, &self.anthropic_patterns),
          (Provider::Gemini, &self.gemini_patterns),
          (Provider::Zen, &self.zen_patterns),
+         (Provider::Zen, &self.zen_messages_patterns),
+         (Provider::Zen, &self.zen_chat_patterns),
          (Provider::Glm, &self.glm_patterns),
+         (Provider::DeepSeek, &self.deepseek_patterns),
          (Provider::Experiential, &self.experiential_patterns),
+         (Provider::Copilot, &self.copilot_patterns),
       ]
+   }
+
+   /// Zen answers each model on exactly one endpoint and 500s on the other
+   /// two. `union-alpha` takes `/messages`, the mimo family takes
+   /// `/chat/completions`.
+   pub fn zen_dialect(&self, model: &str) -> ZenDialect {
+      // Listed least specific first so `max_by_key`, which keeps the last of
+      // a tie, leaves a name in two lists on the responses endpoint.
+      [
+         (ZenDialect::Chat, best_match(&self.zen_chat_patterns, model)),
+         (
+            ZenDialect::Messages,
+            best_match(&self.zen_messages_patterns, model),
+         ),
+         (ZenDialect::Responses, best_match(&self.zen_patterns, model)),
+      ]
+      .into_iter()
+      .filter_map(|(dialect, score)| Some((dialect, score?)))
+      .max_by_key(|&(_, score)| score)
+      .map_or(ZenDialect::Responses, |(dialect, _)| dialect)
    }
 
    /// The name meant when a backend prefix was dropped, `fable-5-1` for
@@ -302,27 +394,18 @@ pub fn pattern_specificity(pattern: &str, model: &str) -> Option<usize> {
    }
 }
 
+fn best_match(patterns: &[String], model: &str) -> Option<usize> {
+   patterns
+      .iter()
+      .filter_map(|pattern| pattern_specificity(pattern, model))
+      .max()
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelAlias {
    pub model: String,
    #[serde(default)]
    pub effort: Option<String>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(default)]
-struct FileConfig {
-   bind: Option<String>,
-   metrics_bind: Option<String>,
-   db: Option<PathBuf>,
-   codex: Option<CodexConfig>,
-   anthropic: Option<AnthropicConfig>,
-   gemini: Option<GeminiConfig>,
-   zen: Option<ZenConfig>,
-   glm: Option<GlmConfig>,
-   experiential: Option<ExperientialConfig>,
-   pricing: Option<PricingConfig>,
-   models: Option<ModelsConfig>,
 }
 
 impl Config {
@@ -333,59 +416,32 @@ impl Config {
          .or_else(|| env::var("SLOP_CONFIG").ok().map(PathBuf::from))
          .unwrap_or_else(|| xdg_dir("XDG_CONFIG_HOME", ".config").join("slop-proxy/config.toml"));
 
-      let file = if config_path.exists() {
+      let mut cfg = if config_path.exists() {
          let raw = fs::read_to_string(&config_path)
             .wrap_err_with(|| format!("reading {}", config_path.display()))?;
-         toml::from_str::<FileConfig>(&raw)
+         toml::from_str::<Self>(&raw)
             .wrap_err_with(|| format!("parsing {}", config_path.display()))?
       } else {
-         FileConfig::default()
+         Self::default()
       };
 
-      let db_path = args
+      if let Some(path) = args
          .db
          .clone()
          .or_else(|| env::var("SLOP_DB").ok().map(PathBuf::from))
-         .or(file.db)
-         .unwrap_or_else(|| xdg_dir("XDG_DATA_HOME", ".local/share").join("slop-proxy/slop.db"));
-
-      let bind = env::var("SLOP_BIND")
-         .ok()
-         .or(file.bind)
-         .unwrap_or_else(|| "[::1]:8484".into());
-
-      Ok(Self {
-         db_path,
-         bind,
-         metrics_bind: file.metrics_bind,
-         codex: file.codex.unwrap_or_default(),
-         anthropic: file.anthropic.unwrap_or_default(),
-         gemini: file.gemini.unwrap_or_default(),
-         zen: file.zen.unwrap_or_default(),
-         glm: file.glm.unwrap_or_default(),
-         experiential: file.experiential.unwrap_or_default(),
-         pricing: file.pricing.unwrap_or_default(),
-         models: file.models.unwrap_or_default(),
-      })
-   }
-}
-
-#[cfg(test)]
-impl Config {
-   pub fn for_tests() -> Self {
-      Self {
-         db_path: PathBuf::new(),
-         bind: String::new(),
-         metrics_bind: None,
-         codex: CodexConfig::default(),
-         anthropic: AnthropicConfig::default(),
-         gemini: GeminiConfig::default(),
-         zen: ZenConfig::default(),
-         glm: GlmConfig::default(),
-         experiential: ExperientialConfig::default(),
-         pricing: PricingConfig::default(),
-         models: ModelsConfig::default(),
+      {
+         cfg.db_path = path;
       }
+      if cfg.db_path.as_os_str().is_empty() {
+         cfg.db_path = xdg_dir("XDG_DATA_HOME", ".local/share").join("slop-proxy/slop.db");
+      }
+      if let Ok(bind) = env::var("SLOP_BIND") {
+         cfg.bind = bind;
+      }
+      if cfg.bind.is_empty() {
+         cfg.bind = "[::1]:8484".into();
+      }
+      Ok(cfg)
    }
 }
 
@@ -509,14 +565,14 @@ mod zen_tests {
          " http://file-one.example:80\n\n# ignored\nhttp://file-two.example:80\n",
       )
       .unwrap();
-      let config = ZenConfig {
+      let config = EgressConfig {
          proxy_urls: vec!["http://inline.example:80".into()],
          proxy_urls_file: Some(path.clone()),
-         ..ZenConfig::default()
+         source_prefixes: Vec::new(),
       };
 
       assert_eq!(
-         config.proxy_urls().unwrap(),
+         config.urls().unwrap(),
          [
             "http://inline.example:80",
             "http://file-one.example:80",

@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod codex;
+pub mod copilot;
+pub mod deepseek;
 pub mod experiential;
 pub mod gemini;
 pub mod glm;
@@ -10,9 +12,12 @@ pub mod zen;
 use crate::clock;
 use crate::db::Db;
 use crate::provider::Provider;
+use crate::translate::chat::ChatError;
 use crate::upstream::SendError;
+use axum::body::Bytes;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -32,8 +37,10 @@ pub enum PoolError {
    NoAccounts(Provider),
    #[error("estimated user quota budget exceeded; retry after {retry_after} seconds")]
    UserQuotaExceeded { retry_after: i64 },
+   #[error("estimated USD budget exceeded; retry after {retry_after} seconds")]
+   SpendBudgetExceeded { retry_after: i64 },
    #[error("all upstream accounts are cooling down")]
-   AllCoolingDown { retry_after: i64 },
+   AllCoolingDown { retry_after: i64, attempts: u32 },
    #[error("the {provider} backend rejected {model}: {body}")]
    BadRequest {
       provider: Provider,
@@ -50,6 +57,19 @@ impl From<SendError> for PoolError {
    }
 }
 
+impl PoolError {
+   pub const fn attempts(&self) -> u32 {
+      match *self {
+         Self::AllCoolingDown { attempts, .. } => attempts,
+         Self::NoAccounts(_)
+         | Self::UserQuotaExceeded { .. }
+         | Self::SpendBudgetExceeded { .. }
+         | Self::BadRequest { .. }
+         | Self::Upstream(_) => 0,
+      }
+   }
+}
+
 pub struct Cooldown {
    pub max: i64,
    pub base: i64,
@@ -60,6 +80,13 @@ pub enum AuthPolicy {
    CoolKey(i64),
 }
 
+/// A messages-API body relayed verbatim to `path`.
+#[derive(Clone)]
+pub struct Relay {
+   pub path: &'static str,
+   pub body: Bytes,
+}
+
 #[derive(Clone, Copy)]
 pub struct Route<'route> {
    pub session_key: &'route str,
@@ -68,7 +95,8 @@ pub struct Route<'route> {
    pub user: &'route str,
    pub pinned_account: Option<i64>,
    pub prefer_trusted: bool,
-   /// Optional Codex quota caps. Ignored by other backends.
+   pub reserved_only: bool,
+   /// Per-token maximum provider quota utilization for Codex windows.
    pub five_hour_limit: Option<f64>,
    pub weekly_limit: Option<f64>,
 }
@@ -83,9 +111,14 @@ impl<'route> Route<'route> {
 
 pub trait Backend: Send + Sync + 'static {
    const PROVIDER: Provider;
-   const RATE_LIMIT: Cooldown;
-   const ON_AUTH: AuthPolicy;
-   const ATTEMPTS: usize = 3;
+   const RATE_LIMIT: Cooldown = Cooldown {
+      max: 3600,
+      base: 60,
+   };
+   /// A static key cannot be refreshed into a working one, so a rejected key
+   /// sits out rather than retrying in place.
+   const ON_AUTH: AuthPolicy = AuthPolicy::CoolKey(15 * 60);
+   const ATTEMPTS: u32 = 3;
    /// Accounts come in two tiers and a token may prefer one, codex only.
    const TIERED: bool = false;
    /// A session waits this long for its own account's cooldown rather than losing the prompt cache.
@@ -95,10 +128,6 @@ pub trait Backend: Send + Sync + 'static {
    /// serve it. Ciphertext in a replayed history decrypts on any account,
    /// probed both ways on 2026-09-07, so moving is safe.
    const SESSION_AFFINITY: bool = false;
-   /// How long a bound session sleeps through its own account's cooldown.
-   /// Rate-limit cooldowns here are 60s, and the alternative is failing the
-   /// turn, since the session cannot be served anywhere else.
-   const BOUND_WAIT_SECS: i64 = 0;
    /// The backend serves without an account, zen's free tier.
    const ANONYMOUS: bool = false;
 
@@ -139,7 +168,7 @@ pub trait Backend: Send + Sync + 'static {
 
    /// Each dialect buries its one useful sentence at a different depth.
    fn reason(body: String) -> String {
-      body
+      ChatError::reason(body)
    }
 
    fn usage_from(&self, resp: &Self::Response) -> Option<AccountUsage> {
@@ -157,6 +186,12 @@ pub struct Pool<B: Backend> {
    slots: Slots,
    backend: B,
    bound: Mutex<HashMap<String, Bound>>,
+}
+
+pub struct Served<Response> {
+   pub account_id: Option<i64>,
+   pub response: Response,
+   pub attempts: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -227,14 +262,10 @@ impl<B: Backend> Pool<B> {
       (clock::unix_now() - entry.seen < BINDING_TTL_SECS).then_some(entry.account_id)
    }
 
-   /// A bound session has nowhere else to go, so a short cooldown on its own
-   /// account is worth sleeping through rather than failing the turn.
-   async fn wait_out_own_cooldown(&self, route: Route<'_>, preferred: Option<&Arc<Slot>>) {
-      let wait = if self.bound_account(route.session_key).await.is_some() {
-         B::BOUND_WAIT_SECS
-      } else {
-         B::STICKY_WAIT_SECS
-      };
+   /// A short cooldown on the session's own account is worth sleeping through
+   /// rather than losing the prompt cache.
+   async fn wait_out_own_cooldown(&self, preferred: Option<&Arc<Slot>>) {
+      let wait = B::STICKY_WAIT_SECS;
       let Some(preferred) = preferred.filter(|_| wait > 0) else {
          return;
       };
@@ -267,20 +298,31 @@ impl<B: Backend> Pool<B> {
       );
    }
 
-   pub const fn backend(&self) -> &B {
-      &self.backend
+   pub async fn slot(&self, account_id: Option<i64>) -> Option<Arc<Slot>> {
+      self.slots.by_id(account_id?).await
    }
 
-   pub async fn len(&self) -> usize {
-      self.slots.len().await
-   }
+   /// Every account on one provider sees the same catalog, so the first that
+   /// answers speaks for all of them.
+   pub async fn first_answer<T, E, Fetch>(&self, fetch: Fetch) -> Option<T>
+   where
+      E: Display,
+      Fetch: AsyncFn(&B, &str, &Slot) -> Result<T, E>,
+   {
+      for slot in self.slots.list().await {
+         if self.slots.is_disabled(&slot).await {
+            continue;
+         }
 
-   pub async fn reload(&self) -> eyre::Result<()> {
-      self.slots.reload().await
-   }
-
-   pub async fn snapshot(&self) -> Vec<AccountSnapshot> {
-      self.slots.snapshot().await
+         let Ok(token) = self.slots.fresh_token(&slot, false).await else {
+            continue;
+         };
+         match fetch(&self.backend, &token, &slot).await {
+            Ok(answer) => return Some(answer),
+            Err(err) => tracing::debug!("models for {}: {err}", slot.display),
+         }
+      }
+      None
    }
 
    /// An account with an allowlist is invisible to everyone else, and a pinned
@@ -291,7 +333,7 @@ impl<B: Backend> Pool<B> {
    /// then does the token's trusted preference break the tie. Within a group
    /// a session sticks to one account, since a prompt cache lives on the
    /// account that built it and scattering re-bills the whole prefix.
-   pub(crate) async fn ranked(&self, route: Route<'_>) -> Vec<Arc<Slot>> {
+   pub async fn ranked(&self, route: Route<'_>) -> Vec<Arc<Slot>> {
       let slots = self.slots.list().await;
       // A pin names one account across the whole fleet, so a pool that does
       // not hold it is being asked about a different provider and ignores it.
@@ -307,15 +349,10 @@ impl<B: Backend> Pool<B> {
          if pinned.is_some_and(|id| slot.id != id) || !slot.serves(route.user) {
             continue;
          }
-         if B::PROVIDER == Provider::OpenAi
-            && !self
-               .slots
-               .within_quota_limits(&slot, route.five_hour_limit, route.weekly_limit)
-               .await
-         {
+         if slot.reserved != route.reserved_only {
             continue;
          }
-         if B::PROVIDER == Provider::OpenAi
+         if B::TIERED
             && let Some(tier) = route.explicit_tier()
             && !self.slots.serves_tier(&slot, route.model, tier).await
          {
@@ -407,7 +444,13 @@ impl<B: Backend> Pool<B> {
          .user_spend_retry_after(route.user, account_id)
          .await
          .map_err(|err| PoolError::Upstream(format!("checking estimated USD budget: {err}")))?;
-      Ok(quota.or(spend))
+      if quota.is_some() {
+         return Ok(quota);
+      }
+      if let Some(retry_after) = spend {
+         return Err(PoolError::SpendBudgetExceeded { retry_after });
+      }
+      Ok(None)
    }
 
    async fn served(&self, slot: &Slot, resp: B::Response) -> B::Response {
@@ -420,6 +463,29 @@ impl<B: Backend> Pool<B> {
       resp
    }
 
+   fn bad_request(route: Route<'_>, body: String) -> PoolError {
+      PoolError::BadRequest {
+         provider: B::PROVIDER,
+         model: route.model.into(),
+         body,
+      }
+   }
+
+   async fn deliver(
+      &self,
+      slot: &Slot,
+      route: Route<'_>,
+      resp: B::Response,
+      attempts: u32,
+   ) -> Served<B::Response> {
+      self.bind_session(route.session_key, slot.id).await;
+      Served {
+         account_id: Some(slot.id),
+         response: self.served(slot, resp).await,
+         attempts,
+      }
+   }
+
    /// Google refills a token bucket in 20-40s and the whole pool empties at
    /// once, so a sweep repeats until the budget is spent. The wait is
    /// jittered to stop a queue waking together and draining the refill.
@@ -427,19 +493,16 @@ impl<B: Backend> Pool<B> {
       &self,
       route: Route<'_>,
       req: B::Request,
-   ) -> Result<(Option<i64>, B::Response), PoolError> {
-      // Check once per request, before routing chooses an account. The
-      // account-scoped checks in each sweep remain necessary for fallback.
-      if let Some(retry_after) = self.fleet_quota_retry_after(route).await? {
-         return Err(PoolError::UserQuotaExceeded { retry_after });
-      }
+   ) -> Result<Served<B::Response>, PoolError> {
       let budget = self.backend.retry_budget();
       let deadline = Instant::now() + budget;
+      let mut prior_attempts = 0_u32;
       loop {
-         let err = match self.sweep(route, &req).await {
+         let err = match self.sweep(route, &req, prior_attempts).await {
             Err(err @ PoolError::AllCoolingDown { .. }) if !budget.is_zero() => err,
             other => return other,
          };
+         prior_attempts = err.attempts();
          let left = deadline.saturating_duration_since(Instant::now());
          if left.is_zero() {
             return Err(err);
@@ -478,8 +541,12 @@ impl<B: Backend> Pool<B> {
          {
             retry_after = Some(retry_after.map_or(retry, |old: i64| old.min(retry)));
          }
-         if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
-            retry_after = Some(retry_after.map_or(retry, |old: i64| old.min(retry)));
+         match self.user_quota_retry_after(route, slot.id).await {
+            Ok(Some(retry)) => {
+               retry_after = Some(retry_after.map_or(retry, |old: i64| old.min(retry)));
+            },
+            Ok(None) | Err(PoolError::SpendBudgetExceeded { .. }) => {},
+            Err(err) => return Err(err),
          }
       }
       Ok(retry_after)
@@ -489,68 +556,71 @@ impl<B: Backend> Pool<B> {
       &self,
       route: Route<'_>,
       req: &B::Request,
-   ) -> Result<(Option<i64>, B::Response), PoolError> {
+      prior_attempts: u32,
+   ) -> Result<Served<B::Response>, PoolError> {
       let ranked = self.ranked(route).await;
       if ranked.is_empty() {
-         if let Some(retry_after) = self.quota_retry_after_for_filtered_accounts(route).await? {
-            return Err(PoolError::UserQuotaExceeded { retry_after });
-         }
-         if B::PROVIDER == Provider::OpenAi
+         if B::TIERED
             && let Some(tier) = route.explicit_tier()
          {
-            return Err(PoolError::BadRequest {
-               provider: B::PROVIDER,
-               model: route.model.to_owned(),
-               body: format!(
+            return Err(Self::bad_request(
+               route,
+               format!(
                   "no eligible account advertises service tier {tier} for {}",
                   route.model
                ),
-            });
+            ));
          }
          if B::ANONYMOUS {
             return match self.backend.send_anonymous(route, req).await {
-               Ok(resp) => Ok((None, resp)),
-               Err(SendError::BadRequest(body)) => Err(PoolError::BadRequest {
-                  provider: B::PROVIDER,
-                  model: route.model.into(),
-                  body: B::reason(body),
+               Ok(resp) => Ok(Served {
+                  account_id: None,
+                  response: resp,
+                  attempts: prior_attempts,
                }),
+               Err(SendError::BadRequest(body)) => Err(Self::bad_request(route, B::reason(body))),
                Err(SendError::RateLimited { retry_after, .. }) => Err(PoolError::AllCoolingDown {
                   retry_after: retry_after.unwrap_or(30),
+                  attempts: prior_attempts,
                }),
                Err(err) => Err(PoolError::Upstream(err.to_string())),
             };
          }
          return Err(PoolError::NoAccounts(B::PROVIDER));
       }
-      // Filter before waiting or refreshing credentials. A spent user/account
-      // pair must not prevent routing to another eligible account.
-      let mut eligible = Vec::new();
-      let mut quota_retry: Option<i64> = None;
-      for slot in ranked {
-         if self.slots.is_disabled(&slot).await {
-            continue;
-         }
-         if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
-            quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
-         } else {
-            eligible.push(slot);
-         }
-      }
-      self.wait_out_own_cooldown(route, eligible.first()).await;
+      self.wait_out_own_cooldown(ranked.first()).await;
       let mut last_err = Option::<SendError>::None;
-      let mut attempts = 0;
-      for slot in eligible {
+      let mut quota_retry = self.quota_retry_after_for_filtered_accounts(route).await?;
+      let mut spend_retry = None;
+      let mut attempts = 0_u32;
+      for slot in ranked {
          if attempts >= B::ATTEMPTS {
             break;
          }
-         if !self.slots.try_claim(&slot).await {
+         if self.slots.model_cooling(&slot, route.model).await || !self.slots.try_claim(&slot).await
+         {
             continue;
          }
          // Recheck after a possible cooldown wait and before upstream I/O.
-         if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
+         if let Some(retry) = self
+            .slots
+            .quota_limit_retry_after(&slot, route.five_hour_limit, route.weekly_limit)
+            .await
+         {
             quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
             continue;
+         }
+         match self.user_quota_retry_after(route, slot.id).await {
+            Ok(Some(retry)) => {
+               quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
+               continue;
+            },
+            Ok(None) => {},
+            Err(PoolError::SpendBudgetExceeded { retry_after }) => {
+               spend_retry = Some(spend_retry.map_or(retry_after, |old: i64| old.min(retry_after)));
+               continue;
+            },
+            Err(err) => return Err(err),
          }
          attempts += 1;
          let Ok(token) = self.slots.fresh_token(&slot, false).await else {
@@ -558,25 +628,37 @@ impl<B: Backend> Pool<B> {
          };
          match self.backend.send(&token, &slot, route, req).await {
             Ok(resp) => {
-               self.bind_session(route.session_key, slot.id).await;
-               return Ok((Some(slot.id), self.served(&slot, resp).await));
+               return Ok(self
+                  .deliver(&slot, route, resp, prior_attempts.saturating_add(attempts))
+                  .await);
             },
             Err(SendError::Auth(text)) => match B::ON_AUTH {
                AuthPolicy::CoolKey(secs) => {
                   self.slots.cool(&slot, secs, "key rejected").await;
                   last_err = Some(SendError::Auth(text));
                },
-               AuthPolicy::RefreshOnce => {
+               AuthPolicy::RefreshOnce if slot.auth_mode.refreshable() => {
                   tracing::warn!("account {} got 401, forcing refresh", slot.display);
                   if let Ok(fresh) = self.slots.fresh_token(&slot, true).await {
-                     if let Some(retry) = self.user_quota_retry_after(route, slot.id).await? {
-                        quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
-                        continue;
+                     match self.user_quota_retry_after(route, slot.id).await {
+                        Ok(Some(retry)) => {
+                           quota_retry = Some(quota_retry.map_or(retry, |old| old.min(retry)));
+                           continue;
+                        },
+                        Ok(None) => {},
+                        Err(PoolError::SpendBudgetExceeded { retry_after }) => {
+                           spend_retry = Some(
+                              spend_retry.map_or(retry_after, |old: i64| old.min(retry_after)),
+                           );
+                           continue;
+                        },
+                        Err(err) => return Err(err),
                      }
                      match self.backend.send(&fresh, &slot, route, req).await {
                         Ok(resp) => {
-                           self.bind_session(route.session_key, slot.id).await;
-                           return Ok((Some(slot.id), self.served(&slot, resp).await));
+                           return Ok(self
+                              .deliver(&slot, route, resp, prior_attempts.saturating_add(attempts))
+                              .await);
                         },
                         Err(err) => {
                            self.slots.cool(&slot, 60, "post-refresh failure").await;
@@ -587,6 +669,10 @@ impl<B: Backend> Pool<B> {
                      last_err = Some(SendError::Auth(text));
                   }
                },
+               AuthPolicy::RefreshOnce => {
+                  self.slots.cool(&slot, 60, "key rejected").await;
+                  last_err = Some(SendError::Auth(text));
+               },
             },
             Err(SendError::RateLimited { retry_after, body }) => {
                self
@@ -595,6 +681,13 @@ impl<B: Backend> Pool<B> {
                   .await;
                last_err = Some(SendError::RateLimited { retry_after, body });
             },
+            Err(SendError::ModelLimited { retry_after, body }) => {
+               let secs = retry_after
+                  .unwrap_or(B::RATE_LIMIT.base)
+                  .min(B::RATE_LIMIT.max);
+               self.slots.cool_model(&slot, route.model, secs).await;
+               last_err = Some(SendError::ModelLimited { retry_after, body });
+            },
             Err(SendError::BadRequest(body)) if self.backend.retryable_bad_request(&body) => {
                tracing::warn!(
                    account = %slot.display,
@@ -602,15 +695,15 @@ impl<B: Backend> Pool<B> {
                );
                last_err = Some(SendError::BadRequest(body));
             },
+            Err(SendError::Network(text)) => {
+               tracing::warn!(account = %slot.display, "network error, account not cooled: {text}");
+               last_err = Some(SendError::Network(text));
+            },
             Err(SendError::BadRequest(body)) => {
-               return Err(PoolError::BadRequest {
-                  provider: B::PROVIDER,
-                  model: route.model.into(),
-                  body: B::reason(body),
-               });
+               return Err(Self::bad_request(route, B::reason(body)));
             },
             Err(err) => {
-               self.slots.cool_failure(&slot).await;
+               self.slots.cool_failure(&slot, &err.to_string()).await;
                last_err = Some(err);
             },
          }
@@ -618,15 +711,17 @@ impl<B: Backend> Pool<B> {
       if let Some(retry_after) = quota_retry {
          return Err(PoolError::UserQuotaExceeded { retry_after });
       }
+      if let Some(retry_after) = spend_retry {
+         return Err(PoolError::SpendBudgetExceeded { retry_after });
+      }
       match last_err {
-         Some(SendError::BadRequest(body)) => Err(PoolError::BadRequest {
-            provider: B::PROVIDER,
-            model: route.model.into(),
-            body: B::reason(body),
-         }),
-         Some(SendError::RateLimited { .. }) | None => Err(PoolError::AllCoolingDown {
-            retry_after: self.slots.min_cooldown().await.max(30),
-         }),
+         Some(SendError::BadRequest(body)) => Err(Self::bad_request(route, B::reason(body))),
+         Some(SendError::RateLimited { .. } | SendError::ModelLimited { .. }) | None => {
+            Err(PoolError::AllCoolingDown {
+               retry_after: self.slots.min_cooldown().await.max(30),
+               attempts: prior_attempts.saturating_add(attempts),
+            })
+         },
          Some(err) => Err(PoolError::Upstream(err.to_string())),
       }
    }
@@ -698,6 +793,7 @@ mod retry_tests {
          user: "u",
          pinned_account: None,
          prefer_trusted: false,
+         reserved_only: false,
          five_hour_limit: None,
          weekly_limit: None,
       }
@@ -786,8 +882,11 @@ mod retry_tests {
    #[tokio::test]
    async fn a_rate_limited_pool_is_waited_out_rather_than_handed_back() {
       let pool = pool(1, Duration::from_secs(10));
-      let (_, calls) = pool.execute(route(), ()).await.unwrap();
-      assert_eq!(calls, 2, "the second sweep should have been served");
+      let served = pool.execute(route(), ()).await.unwrap();
+      assert_eq!(
+         served.response, 2,
+         "the second sweep should have been served"
+      );
    }
 
    #[tokio::test]
@@ -804,7 +903,7 @@ mod retry_tests {
 #[cfg(test)]
 mod reason_tests {
    use super::*;
-   use crate::anthropic::client::AnthropicClient;
+   use crate::anthropic::AnthropicClient;
    use crate::codex::client::CodexClient;
    use crate::gemini::client::GeminiClient;
 
@@ -863,6 +962,7 @@ mod user_quota_tests {
          service_tier: None,
          pinned_account: None,
          prefer_trusted: false,
+         reserved_only: false,
          five_hour_limit: None,
          weekly_limit: None,
       }
@@ -985,8 +1085,8 @@ mod user_quota_tests {
       let (db, pool) = pool().await;
       let ranked = pool.ranked(route()).await;
       block(&db, ranked[0].id).await;
-      let (account, ()) = pool.execute(route(), ()).await.unwrap();
-      assert_eq!(account, Some(ranked[1].id));
+      let served = pool.execute(route(), ()).await.unwrap();
+      assert_eq!(served.account_id, Some(ranked[1].id));
       assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
       assert!(matches!(
          pool
@@ -1010,8 +1110,8 @@ mod user_quota_tests {
       db.set_user_spend_budget("alice", ranked[0].id, Some(0.0_f64))
          .await
          .unwrap();
-      let (account, ()) = pool.execute(route(), ()).await.unwrap();
-      assert_eq!(account, Some(ranked[1].id));
+      let served = pool.execute(route(), ()).await.unwrap();
+      assert_eq!(served.account_id, Some(ranked[1].id));
       assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
       let blocked = pool
          .execute(
@@ -1023,7 +1123,7 @@ mod user_quota_tests {
          )
          .await;
       assert!(
-         matches!(blocked, Err(PoolError::UserQuotaExceeded { retry_after }) if retry_after >= 60)
+         matches!(blocked, Err(PoolError::SpendBudgetExceeded { retry_after }) if retry_after >= 60)
       );
       assert_eq!(pool.backend.0.load(Ordering::SeqCst), 1);
    }

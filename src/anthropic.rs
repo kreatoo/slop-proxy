@@ -1,10 +1,29 @@
-use std::time::Duration;
-
 use axum::body::Bytes;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::StatusCode;
+use reqwest::header::{CONTENT_TYPE, HeaderMap};
 
-use crate::config::AnthropicConfig;
-use crate::upstream::{Classify, SendError, classify};
+use crate::clock;
+use crate::config::{AnthropicConfig, EgressConfig};
+use crate::egress::Egresses;
+use crate::provider::AuthMode;
+use crate::upstream::{Classify, SendError, classify, json};
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Model {
+   pub id: String,
+   pub display_name: String,
+   pub created_at: String,
+   #[serde(rename = "type")]
+   pub kind: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct Catalog {
+   pub data: Vec<Model>,
+   pub has_more: bool,
+   pub first_id: Option<String>,
+   pub last_id: Option<String>,
+}
 
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 
@@ -15,7 +34,27 @@ const RULES: Classify = Classify {
       "anthropic-ratelimit-unified-reset",
       "anthropic-ratelimit-requests-reset",
    ],
+   account_faults: &["Your credit balance is too low"],
+   ..Classify::STRICT
 };
+
+/// Every claim a request counts against gets its own `anthropic-ratelimit-unified-<claim>-status` header.
+fn sub_limit_rejected(headers: &HeaderMap) -> bool {
+   let claim_rejected = |claim: &str| {
+      headers
+         .get(format!("anthropic-ratelimit-unified-{claim}-status"))
+         .is_some_and(|value| value == "rejected")
+   };
+   let sub_limit = headers.iter().any(|(name, value)| {
+      value == "rejected"
+         && name
+            .as_str()
+            .strip_prefix("anthropic-ratelimit-unified-")
+            .and_then(|rest| rest.strip_suffix("-status"))
+            .is_some_and(|claim| !matches!(claim, "5h" | "7d" | "overage"))
+   });
+   sub_limit && !claim_rejected("5h") && !claim_rejected("7d")
+}
 
 /// Rolling-window usage as the subscription reports it, without spending an
 /// inference request. `locked_reason` is set when the window is exhausted
@@ -24,20 +63,13 @@ const RULES: Classify = Classify {
 pub struct Window {
    #[serde(default)]
    pub utilization: f64,
-   #[serde(default)]
    pub locked_reason: Option<String>,
-   #[serde(default)]
    pub resets_at: Option<String>,
 }
 
 impl Window {
    pub fn resets_at_unix(&self) -> Option<i64> {
-      self
-         .resets_at
-         .as_deref()?
-         .parse::<jiff::Timestamp>()
-         .ok()
-         .map(jiff::Timestamp::as_second)
+      clock::unix_seconds(self.resets_at.as_deref())
    }
 }
 
@@ -50,34 +82,24 @@ pub struct Limit {
    pub group: String,
    #[serde(default)]
    pub percent: f64,
-   #[serde(default)]
    pub scope: Option<Scope>,
-   #[serde(default)]
    pub is_active: Option<bool>,
-   #[serde(default)]
    pub resets_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Scope {
-   #[serde(default)]
    pub model: Option<ScopedModel>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ScopedModel {
-   #[serde(default)]
    pub display_name: Option<String>,
 }
 
 impl Limit {
    pub fn resets_at_unix(&self) -> Option<i64> {
-      self
-         .resets_at
-         .as_deref()?
-         .parse::<jiff::Timestamp>()
-         .ok()
-         .map(jiff::Timestamp::as_second)
+      clock::unix_seconds(self.resets_at.as_deref())
    }
 
    fn window_name(&self) -> &'static str {
@@ -90,9 +112,7 @@ impl Limit {
 
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct Usage {
-   #[serde(default)]
    pub five_hour: Option<Window>,
-   #[serde(default)]
    pub seven_day: Option<Window>,
    #[serde(default)]
    pub limits: Vec<Limit>,
@@ -106,13 +126,13 @@ impl Usage {
          .any(|window| window.locked_reason.is_some())
    }
 
-   /// Max plans leave `weekly_all` inactive, and a dormant window reports a
-   /// flat zero however much the account spends.
    pub fn windows(&self) -> impl Iterator<Item = (&'static str, &Window)> {
       let dormant: Vec<&'static str> = self
          .limits
          .iter()
-         .filter(|limit| limit.scope.is_none() && limit.is_active == Some(false))
+         .filter(|limit| {
+            limit.scope.is_none() && limit.is_active == Some(false) && limit.percent == 0.0_f64
+         })
          .map(Limit::window_name)
          .collect();
       [("5h", &self.five_hour), ("7d", &self.seven_day)]
@@ -131,6 +151,15 @@ impl Usage {
             .any(|limit| limit.is_active != Some(false) && limit.percent >= 100.0_f64)
       {
          return false;
+      }
+      // Every window has headroom, so a bench outlasting all of their resets
+      // came from a 429 whose reset header no limit backs up.
+      let latest_reset = self
+         .windows()
+         .filter_map(|(_, window)| window.resets_at_unix())
+         .max();
+      if latest_reset.is_some_and(|reset| until > reset.saturating_add(1)) {
+         return true;
       }
       self.limits.iter().any(|limit| {
          limit.scope.is_none()
@@ -157,7 +186,6 @@ impl Usage {
    }
 }
 
-/// Client headers worth carrying through to the upstream request.
 #[derive(Debug, Default, Clone)]
 pub struct RelayHeaders {
    pub version: Option<String>,
@@ -166,18 +194,40 @@ pub struct RelayHeaders {
 }
 
 pub struct AnthropicClient {
-   http: reqwest::Client,
+   direct: Egresses,
+   /// `None` when no egress proxies are configured, so the direct pool is the
+   /// only one that exists.
+   proxied: Option<Egresses>,
    cfg: AnthropicConfig,
 }
 
 impl AnthropicClient {
-   pub fn new(cfg: AnthropicConfig) -> Self {
-      let http = reqwest::Client::builder()
-         .connect_timeout(Duration::from_secs(30))
-         .tcp_keepalive(Duration::from_secs(30))
-         .build()
-         .expect("building http client");
-      Self { http, cfg }
+   pub fn new(cfg: AnthropicConfig) -> eyre::Result<Self> {
+      let proxied = !cfg.egress.proxy_urls.is_empty() || cfg.egress.proxy_urls_file.is_some();
+      Ok(Self {
+         direct: Egresses::new(&EgressConfig::default(), "anthropic", None)?,
+         proxied: proxied
+            .then(|| Egresses::new(&cfg.egress, "anthropic", None))
+            .transpose()?,
+         cfg,
+      })
+   }
+
+   pub const fn proxied(&self) -> Option<&Egresses> {
+      self.proxied.as_ref()
+   }
+
+   /// An account marked with `accounts egress` leaves through the proxies, and
+   /// everything else, the pooled seats included, dials Anthropic directly.
+   const fn egresses(&self, via_proxy: bool) -> &Egresses {
+      if via_proxy && let Some(proxied) = self.proxied.as_ref() {
+         return proxied;
+      }
+      &self.direct
+   }
+
+   fn url(&self, path: &str) -> String {
+      format!("{}{path}", self.cfg.base_url.trim_end_matches('/'))
    }
 
    pub const fn soft_utilization_limit(&self) -> f64 {
@@ -186,50 +236,27 @@ impl AnthropicClient {
 
    pub async fn usage(&self, access_token: &str) -> Result<Usage, SendError> {
       let resp = self
-         .http
-         .get(format!(
-            "{}/api/oauth/usage",
-            self.cfg.base_url.trim_end_matches('/')
-         ))
+         .direct
+         .http(0)
+         .get(self.url("/api/oauth/usage"))
          .bearer_auth(access_token)
          .header("anthropic-beta", OAUTH_BETA)
          .send()
-         .await
-         .map_err(|err| SendError::Network(err.to_string()))?;
-      let resp = classify(resp, Classify::STRICT).await?;
-      let status = resp.status().as_u16();
-      resp.json().await.map_err(|err| SendError::Upstream {
-         status,
-         body: format!("parsing usage response: {err}"),
-      })
+         .await?;
+      json(resp, Classify::STRICT).await
    }
 
-   /// The catalog exactly as the backend sends it. Relayed rather than
-   /// rebuilt so a client sees the same model ids and display names it would
-   /// talking to Anthropic directly.
-   pub async fn models_raw(
-      &self,
-      access_token: &str,
-   ) -> Result<(reqwest::StatusCode, String), SendError> {
+   pub async fn models(&self, access_token: &str) -> Result<Vec<Model>, SendError> {
       let resp = self
-         .http
-         .get(format!(
-            "{}/v1/models?limit=100",
-            self.cfg.base_url.trim_end_matches('/')
-         ))
+         .direct
+         .http(0)
+         .get(self.url("/v1/models?limit=100"))
          .bearer_auth(access_token)
          .header("anthropic-beta", OAUTH_BETA)
          .header("anthropic-version", "2023-06-01")
          .send()
-         .await
-         .map_err(|err| SendError::Network(err.to_string()))?;
-      let status = resp.status();
-      let status_u16 = status.as_u16();
-      let body = resp.text().await.map_err(|err| SendError::Upstream {
-         status: status_u16,
-         body: format!("reading models response: {err}"),
-      })?;
-      Ok((status, body))
+         .await?;
+      Ok(json::<Catalog>(resp, Classify::STRICT).await?.data)
    }
 
    /// Statuses other than 401/429/5xx come back as `Ok` so the caller can
@@ -237,35 +264,72 @@ impl AnthropicClient {
    /// account become errors.
    pub async fn post(
       &self,
-      access_token: &str,
+      credential: &str,
+      mode: AuthMode,
+      via_egress: bool,
       path: &str,
       body: &Bytes,
       hdrs: &RelayHeaders,
    ) -> Result<reqwest::Response, SendError> {
-      let beta = match hdrs.beta.as_ref() {
-         Some(beta) if beta.split(',').any(|part| part.trim() == OAUTH_BETA) => beta.clone(),
-         Some(beta) => format!("{OAUTH_BETA},{beta}"),
-         None => OAUTH_BETA.into(),
+      let beta = match mode {
+         AuthMode::OAuth => Some(match hdrs.beta.as_ref() {
+            Some(beta) if beta.split(',').any(|part| part.trim() == OAUTH_BETA) => beta.clone(),
+            Some(beta) => format!("{OAUTH_BETA},{beta}"),
+            None => OAUTH_BETA.into(),
+         }),
+         // A key cannot claim the subscription beta, but the caller's own flags
+         // still gate the fields it sent, `context_management` among them.
+         AuthMode::ApiKey => hdrs.beta.clone(),
       };
-      let mut req = self
-         .http
-         .post(format!("{}{path}", self.cfg.base_url.trim_end_matches('/')))
-         .bearer_auth(access_token)
-         .header(
-            "anthropic-version",
-            hdrs.version.as_deref().unwrap_or("2023-06-01"),
-         )
-         .header("anthropic-beta", beta)
-         .header(CONTENT_TYPE, "application/json")
-         .body(body.clone());
-      if let Some(agent) = hdrs.user_agent.as_ref() {
-         req = req.header("user-agent", agent);
+      let url = self.url(path);
+      let resp = self
+         .egresses(via_egress)
+         .send(|http| {
+            let mut req = http
+               .post(&url)
+               .header(
+                  "anthropic-version",
+                  hdrs.version.as_deref().unwrap_or("2023-06-01"),
+               )
+               .header(CONTENT_TYPE, "application/json")
+               .body(body.clone());
+            req = match mode {
+               AuthMode::OAuth => req.bearer_auth(credential),
+               AuthMode::ApiKey => req.header("x-api-key", credential),
+            };
+            if let Some(beta) = beta.as_deref() {
+               req = req.header("anthropic-beta", beta);
+            }
+            if let Some(agent) = hdrs.user_agent.as_ref() {
+               req = req.header("user-agent", agent);
+            }
+            req.send()
+         })
+         .await?;
+      if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+         let limits = resp
+            .headers()
+            .iter()
+            .filter(|&(name, _)| {
+               name.as_str() == "retry-after" || name.as_str().starts_with("anthropic-ratelimit-")
+            })
+            .map(|(name, value)| format!("{name}={}", value.to_str().unwrap_or("?")))
+            .collect::<Vec<_>>()
+            .join(" ");
+         tracing::warn!("anthropic 429 headers: {limits}");
       }
-      let resp = req
-         .send()
-         .await
-         .map_err(|err| SendError::Network(err.to_string()))?;
-      classify(resp, RULES).await
+      let model_limited =
+         resp.status() == StatusCode::TOO_MANY_REQUESTS && sub_limit_rejected(resp.headers());
+      match classify(resp, RULES).await {
+         Err(SendError::RateLimited {
+            retry_after,
+            body: text,
+         }) if model_limited => Err(SendError::ModelLimited {
+            retry_after,
+            body: text,
+         }),
+         other => other,
+      }
    }
 }
 

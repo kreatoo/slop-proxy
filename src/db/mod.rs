@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use eyre::{Result, WrapErr as _};
-use rusqlite::Connection;
+use rusqlite::{Connection, Params, Row};
 use tokio::sync::oneshot;
 
 #[derive(Clone)]
@@ -52,6 +52,25 @@ impl Worker {
          .map_err(|_| eyre::eyre!("database worker stopped"))?;
       receiver.await.wrap_err("database worker stopped")?
    }
+
+   async fn rows<T>(
+      &self,
+      sql: impl Into<String>,
+      params: impl Params + Send + 'static,
+      map: impl FnMut(&Row) -> rusqlite::Result<T> + Send + 'static,
+   ) -> Result<Vec<T>>
+   where
+      T: Send + 'static,
+   {
+      let sql = sql.into();
+      self
+         .call(move |conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params, map)?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+         })
+         .await
+   }
 }
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -84,12 +103,10 @@ impl Db {
       })
    }
 
-   pub(crate) async fn call<T>(
-      &self,
-      query: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-   ) -> Result<T>
+   pub async fn call<T, Query>(&self, query: Query) -> Result<T>
    where
       T: Send + 'static,
+      Query: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
    {
       self.writer.call(query).await
    }
@@ -101,8 +118,11 @@ impl Db {
 
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
    ("accounts", "http_referer", "TEXT"),
+   ("accounts", "turn_state", "TEXT"),
    ("accounts", "auth_mode", "TEXT NOT NULL DEFAULT 'oauth'"),
    ("accounts", "allowed_users", "TEXT NOT NULL DEFAULT ''"),
+   ("accounts", "reserved", "INTEGER NOT NULL DEFAULT 0"),
+   ("accounts", "egress", "INTEGER NOT NULL DEFAULT 0"),
    ("usage_log", "provider", "TEXT NOT NULL DEFAULT ''"),
    ("usage_log", "list_cost_usd", "REAL NOT NULL DEFAULT 0"),
    ("usage_log", "service_tier", "TEXT NOT NULL DEFAULT ''"),
@@ -116,14 +136,18 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
    ("usage_log", "response_bytes", "INTEGER NOT NULL DEFAULT 0"),
    ("usage_log", "ttft_ms", "INTEGER"),
    ("usage_log", "stop_reason", "TEXT NOT NULL DEFAULT ''"),
+   ("usage_log", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+   ("usage_log", "turn_state_blocks", "INTEGER"),
+   ("usage_log", "cache_ttl_secs", "INTEGER"),
    (
       "api_tokens",
       "allowed_providers",
       "TEXT NOT NULL DEFAULT ''",
    ),
-   ("api_tokens", "pinned_account", "INTEGER"),
    ("api_tokens", "five_hour_limit", "REAL"),
    ("api_tokens", "weekly_limit", "REAL"),
+   ("api_tokens", "pinned_account", "INTEGER"),
+   ("api_tokens", "reserved_only", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Indexes over columns `ADDED_COLUMNS` introduces, so they are built after

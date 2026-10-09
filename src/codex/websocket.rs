@@ -9,8 +9,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config, tungstenite};
 
-use super::client::CodexClient;
-use crate::upstream::{Classify, SendError, classify};
+use crate::codex::client::{CodexClient, EXHAUSTED_CODES, RULES};
+use crate::upstream::{SendError, classify};
 
 pub const MAX_MESSAGE_SIZE: usize = 192 * 1024 * 1024;
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -40,9 +40,7 @@ impl ResponseError {
    pub const fn transient(&self) -> bool {
       matches!(self.fault, Fault::Transient) && self.status >= 500
    }
-}
 
-impl ResponseError {
    pub fn normalize(self, event: &mut Value) {
       let bare = event.get("type").and_then(Value::as_str) == Some("error");
       if bare {
@@ -91,18 +89,14 @@ pub fn response_error(event: &Value) -> Option<ResponseError> {
       | "context_length_exceeded"
       | "invalid_encrypted_content"
       | "previous_response_not_found" => (400, Fault::Caller),
-      "insufficient_quota" | "usage_limit_reached" | "usage_not_included" => {
-         (429, Fault::Exhausted)
-      },
+      _ if EXHAUSTED_CODES.contains(&code) => (429, Fault::Exhausted),
       "rate_limit_exceeded" => (429, Fault::Transient),
       "server_is_overloaded" | "slow_down" | "model_at_capacity" => (503, Fault::Transient),
       _ => match kind {
          "invalid_request_error" => (400, Fault::Caller),
          "authentication_error" => (401, Fault::Caller),
          "permission_error" => (403, Fault::Caller),
-         "usage_limit_reached" | "usage_not_included" | "insufficient_quota" => {
-            (429, Fault::Exhausted)
-         },
+         _ if EXHAUSTED_CODES.contains(&kind) => (429, Fault::Exhausted),
          "rate_limit_error" | "rate_limit_exceeded" => (429, Fault::Transient),
          "server_error" | "api_error" | "internal_server_error" => (500, Fault::Transient),
          _ if code == "server_error" => (500, Fault::Transient),
@@ -114,20 +108,24 @@ pub fn response_error(event: &Value) -> Option<ResponseError> {
       .and_then(Value::as_u64)
       .or_else(|| event.get("status_code").and_then(Value::as_u64))
       .unwrap_or(fallback);
-   let fault = match fault {
-      Fault::Transient if status < 500 && status != 429 => Fault::Caller,
-      Fault::Caller => Fault::Caller,
-      Fault::Exhausted => Fault::Exhausted,
-      Fault::Transient => Fault::Transient,
+   let fault = if fault == Fault::Transient && status < 500 && status != 429 {
+      Fault::Caller
+   } else {
+      fault
    };
-   (400..600)
-      .contains(&status)
-      .then_some(ResponseError { status: status as u16, fault })
+   (400..600).contains(&status).then_some(ResponseError {
+      status: status as u16,
+      fault,
+   })
 }
 
 impl CodexClient {
    pub fn responses_url(&self) -> String {
       format!("{}/responses", self.config().base_url.trim_end_matches('/'))
+   }
+
+   pub const fn pins_turn_state(&self) -> bool {
+      self.config().pin_turn_state
    }
 
    pub fn responses_headers(
@@ -257,15 +255,7 @@ impl CodexClient {
          Err(tungstenite::Error::Http(response)) => {
             let (parts, body) = response.into_parts();
             let rejected = Response::from_parts(parts, body.unwrap_or_default());
-            let classified = classify(
-               rejected.into(),
-               Classify {
-                  pass: |_| false,
-                  auth: &[401],
-                  reset_headers: &["x-codex-primary-reset-at"],
-               },
-            )
-            .await;
+            let classified = classify(rejected.into(), RULES).await;
             Err(classified.err().unwrap_or_else(|| {
                SendError::Network("upstream did not upgrade to WebSocket".into())
             }))

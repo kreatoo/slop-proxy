@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::translate::empty_schema;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResponsesRequest {
@@ -248,6 +250,22 @@ pub struct ToolDef {
    pub parameters: Option<Box<RawValue>>,
 }
 
+impl ToolDef {
+   pub fn function(
+      name: String,
+      description: Option<String>,
+      parameters: Option<Box<RawValue>>,
+   ) -> Self {
+      Self {
+         kind: "function".into(),
+         name,
+         description,
+         strict: false,
+         parameters: Some(parameters.unwrap_or_else(empty_schema)),
+      }
+   }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResponsesEvent {
@@ -415,8 +433,7 @@ impl ResponsesEvent {
    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TerminalKind {
    Completed,
    Incomplete,

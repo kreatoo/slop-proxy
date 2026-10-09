@@ -1,5 +1,6 @@
 use axum::Json;
 use axum::extract::{Extension, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse as _, Response};
 use serde::Serialize;
 
@@ -48,7 +49,12 @@ pub async fn usage(
       Ok(reports) => reports,
       Err(err) => {
          tracing::error!(user = %auth.user, "reading usage report failed: {err}");
-         return error_response(Dialect::OpenAi, 500, "api_error", "internal error");
+         return error_response(
+            Dialect::OpenAi,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "internal error",
+         );
       },
    };
 

@@ -10,14 +10,21 @@ use serde_json::Value;
 use tokio::time::{sleep, timeout};
 
 use crate::codex::models::ModelsResponse;
+use crate::codex::types::ContentPart;
 use crate::config::CodexConfig;
-use crate::upstream::{Classify, SendError, classify};
+use crate::upstream::{Classify, SendError, classify, json};
 
-const RULES: Classify = Classify {
-   pass: |_| false,
+pub const RULES: Classify = Classify {
    auth: &[401],
    reset_headers: &["x-codex-primary-reset-at"],
+   ..Classify::STRICT
 };
+
+pub const EXHAUSTED_CODES: &[&str] = &[
+   "usage_limit_reached",
+   "usage_not_included",
+   "insufficient_quota",
+];
 
 /// One rolling limit window as the usage endpoint reports it.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
@@ -26,7 +33,6 @@ pub struct UsageWindow {
    pub used_percent: f64,
    #[serde(default)]
    pub limit_window_seconds: i64,
-   #[serde(default)]
    pub reset_at: Option<i64>,
 }
 
@@ -34,9 +40,7 @@ pub struct UsageWindow {
 pub struct RateLimit {
    #[serde(default)]
    pub limit_reached: bool,
-   #[serde(default)]
    pub primary_window: Option<UsageWindow>,
-   #[serde(default)]
    pub secondary_window: Option<UsageWindow>,
 }
 
@@ -101,7 +105,10 @@ fn drop_undecryptable_payloads(req: &Bytes) -> Option<Bytes> {
       };
       for part in parts.iter_mut() {
          if part.get("encrypted_content").is_some() {
-            *part = serde_json::json!({"type": "input_text", "text": DROPPED_PAYLOAD_NOTE});
+            *part = serde_json::to_value(ContentPart::InputText {
+               text: DROPPED_PAYLOAD_NOTE.to_owned(),
+            })
+            .ok()?;
             dropped += 1;
          }
       }
@@ -114,6 +121,20 @@ fn drop_undecryptable_payloads(req: &Bytes) -> Option<Bytes> {
       "retrying without the payloads the backend cannot decrypt"
    );
    serde_json::to_vec(&body).ok().map(Bytes::from)
+}
+
+#[derive(Deserialize)]
+struct OpeningEvent {
+   #[serde(rename = "type")]
+   kind: Option<String>,
+   error: Option<OpeningError>,
+}
+
+#[derive(Default, Deserialize)]
+struct OpeningError {
+   code: Option<String>,
+   #[serde(rename = "type")]
+   kind: Option<String>,
 }
 
 /// `response.created` always arrives first, even when the next event is
@@ -138,45 +159,24 @@ fn opening(head: &[u8]) -> Opening {
       if data.is_empty() {
          continue;
       }
-      let Ok(event) = serde_json::from_str::<Value>(&data) else {
+      let Ok(event) = serde_json::from_str::<OpeningEvent>(&data) else {
          return Opening::Serve;
       };
-      let error = match event
-         .get("type")
-         .and_then(Value::as_str)
-         .unwrap_or_default()
-      {
+      let error = match event.kind.as_deref().unwrap_or_default() {
          "response.created" | "response.in_progress" | "keepalive" => continue,
-         "error" => event.get("error"),
+         "error" => event.error,
          _ => return Opening::Serve,
       };
-      let field = |name: &str| {
-         error
-            .and_then(|error| error.get(name))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-      };
-      return if field("code") == "invalid_encrypted_content" {
+      let error = error.unwrap_or_default();
+      return if error.code.as_deref() == Some("invalid_encrypted_content") {
          Opening::Undecryptable
-      } else if field("type") == "invalid_request_error" {
+      } else if error.kind.as_deref() == Some("invalid_request_error") {
          Opening::Serve
       } else {
          Opening::Refused(data)
       };
    }
    Opening::Pending
-}
-
-fn is_caller_refusal(body: &str) -> bool {
-   [
-      "cyber_policy",
-      "invalid_prompt",
-      "context_length_exceeded",
-      "invalid_encrypted_content",
-      "previous_response_not_found",
-   ]
-   .iter()
-   .any(|code| body.contains(code))
 }
 
 async fn refuse_early(resp: reqwest::Response) -> Result<reqwest::Response, SendError> {
@@ -192,16 +192,7 @@ async fn refuse_early(resp: reqwest::Response) -> Result<reqwest::Response, Send
          Opening::Serve => break,
          Opening::Undecryptable => return Err(SendError::BadRequest(UNDECRYPTABLE.into())),
          Opening::Refused(body) => {
-            if is_caller_refusal(&body) {
-               return Err(SendError::BadRequest(body));
-            }
-            let spent = [
-               "usage_limit_reached",
-               "usage_not_included",
-               "insufficient_quota",
-            ]
-            .iter()
-            .any(|code| body.contains(code));
+            let spent = EXHAUSTED_CODES.iter().any(|code| body.contains(code));
             let retry_after = if spent {
                EXHAUSTED_REFUSAL_COOLDOWN
             } else {
@@ -225,7 +216,7 @@ async fn refuse_early(resp: reqwest::Response) -> Result<reqwest::Response, Send
             },
             chunk = stream.next() => match chunk {
                Some(Ok(chunk)) => head.extend_from_slice(&chunk),
-               Some(Err(err)) => return Err(SendError::Network(err.to_string())),
+               Some(Err(err)) => return Err(err.into()),
                None => break,
             },
          },
@@ -240,7 +231,7 @@ async fn refuse_early(resp: reqwest::Response) -> Result<reqwest::Response, Send
 }
 
 impl CodexClient {
-   pub(super) const fn config(&self) -> &CodexConfig {
+   pub const fn config(&self) -> &CodexConfig {
       &self.cfg
    }
 
@@ -255,6 +246,18 @@ impl CodexClient {
       Self { http, cfg }
    }
 
+   pub fn authed(
+      &self,
+      req: reqwest::RequestBuilder,
+      token: &str,
+      account: &str,
+   ) -> reqwest::RequestBuilder {
+      req.bearer_auth(token)
+         .header("chatgpt-account-id", account)
+         .header("originator", self.cfg.originator.as_str())
+         .header("version", self.cfg.version.as_str())
+   }
+
    pub async fn post(
       &self,
       access_token: &str,
@@ -264,68 +267,46 @@ impl CodexClient {
       model: &str,
       headers: &header::HeaderMap,
    ) -> Result<reqwest::Response, SendError> {
-      match self
-         .send_once(
-            access_token,
-            chatgpt_account_id,
-            req,
-            session_id,
-            model,
-            headers,
-         )
-         .await
-      {
-         Err(SendError::BadRequest(body)) => {
-            if body.contains("max_output_tokens") {
-               if let Ok(mut retry) = serde_json::from_slice::<Retry>(req) {
-                  if retry.max_output_tokens.take().is_some() {
-                     if let Ok(retry) = serde_json::to_vec(&retry) {
-                        tracing::debug!("upstream rejected max_output_tokens; retrying without it");
-                        return self
-                           .send_once(
-                              access_token,
-                              chatgpt_account_id,
-                              &Bytes::from(retry),
-                              session_id,
-                              model,
-                              headers,
-                           )
-                           .await;
-                     }
-                  }
-               }
-            }
-            if body == UNDECRYPTABLE {
-               if let Some(retry) = drop_undecryptable_payloads(req) {
-                  return self
-                     .send_once(
-                        access_token,
-                        chatgpt_account_id,
-                        &retry,
-                        session_id,
-                        model,
-                        headers,
-                     )
-                     .await;
-               }
-            }
-            Err(SendError::BadRequest(body))
-         },
-         // Cloudflare occasionally 403s fresh headless clients; the cookie
-         // jar picks up clearance on the first response, so retry once.
-         Err(SendError::Upstream { status: 403, .. }) => {
-            self
-               .send_once(
-                  access_token,
-                  chatgpt_account_id,
-                  req,
-                  session_id,
-                  model,
-                  headers,
-               )
-               .await
-         },
-         other => other,
+      let mut body = req.clone();
+      let mut retried = false;
+      loop {
+         let result = self
+            .send_once(
+               access_token,
+               chatgpt_account_id,
+               &body,
+               session_id,
+               model,
+               headers,
+            )
+            .await;
+         let retry_body = match result.as_ref() {
+            _ if retried => None,
+            Err(&SendError::BadRequest(ref text))
+               if text.contains("max_output_tokens")
+                  && let Ok(mut retry) = serde_json::from_slice::<Retry>(req)
+                  && retry.max_output_tokens.take().is_some()
+                  && let Ok(retry) = serde_json::to_vec(&retry) =>
+            {
+               tracing::debug!("upstream rejected max_output_tokens; retrying without it");
+               Some(Bytes::from(retry))
+            },
+            Err(&SendError::BadRequest(ref text))
+               if text == UNDECRYPTABLE
+                  && let Some(retry) = drop_undecryptable_payloads(req) =>
+            {
+               Some(retry)
+            },
+            // Cloudflare occasionally 403s fresh headless clients; the cookie
+            // jar picks up clearance on the first response, so retry once.
+            Err(&SendError::Upstream { status: 403, .. }) => Some(req.clone()),
+            _ => None,
+         };
+         let Some(next) = retry_body else {
+            return result;
+         };
+         body = next;
+         retried = true;
       }
    }
 
@@ -336,71 +317,18 @@ impl CodexClient {
       access_token: &str,
       chatgpt_account_id: &str,
    ) -> Result<Usage, SendError> {
-      let resp = self
+      let req = self
          .http
-         .get(format!("{}/usage", self.cfg.base_url.trim_end_matches('/')))
-         .timeout(Duration::from_secs(15))
-         .bearer_auth(access_token)
-         .header("chatgpt-account-id", chatgpt_account_id)
-         .header("originator", self.cfg.originator.clone())
-         .header("version", self.cfg.version.clone())
+         .get(format!("{}/usage", self.cfg.base_url.trim_end_matches('/')));
+      let resp = self
+         .authed(req, access_token, chatgpt_account_id)
          .send()
-         .await
-         .map_err(|err| SendError::Network(err.to_string()))?;
-      let resp = classify(resp, Classify::STRICT).await?;
-      let status = resp.status().as_u16();
-      resp.json().await.map_err(|err| SendError::Upstream {
-         status,
-         body: format!("parsing usage response: {err}"),
-      })
+         .await?;
+      json(resp, Classify::STRICT).await
    }
 
    pub const fn soft_utilization_limit(&self) -> f64 {
       self.cfg.soft_utilization_limit
-   }
-
-   pub fn models_url(&self) -> String {
-      format!(
-         "{}/models?client_version={}",
-         self.cfg.base_url.trim_end_matches('/'),
-         self.cfg.version
-      )
-   }
-
-   async fn models_response(
-      &self,
-      access_token: &str,
-      chatgpt_account_id: &str,
-   ) -> Result<reqwest::Response, SendError> {
-      self
-         .http
-         .get(self.models_url())
-         .timeout(Duration::from_secs(10))
-         .bearer_auth(access_token)
-         .header("ChatGPT-Account-ID", chatgpt_account_id)
-         .header("chatgpt-account-id", chatgpt_account_id)
-         .header("originator", self.cfg.originator.clone())
-         .header("version", self.cfg.version.clone())
-         .send()
-         .await
-         .map_err(|err| SendError::Network(err.to_string()))
-   }
-
-   pub async fn models_raw(
-      &self,
-      access_token: &str,
-      chatgpt_account_id: &str,
-   ) -> Result<(reqwest::StatusCode, String), SendError> {
-      let resp = self
-         .models_response(access_token, chatgpt_account_id)
-         .await?;
-      let status = resp.status();
-      let status_u16 = status.as_u16();
-      let body = resp.text().await.map_err(|err| SendError::Upstream {
-         status: status_u16,
-         body: format!("reading models response: {err}"),
-      })?;
-      Ok((status, body))
    }
 
    pub async fn catalog(
@@ -408,16 +336,68 @@ impl CodexClient {
       access_token: &str,
       chatgpt_account_id: &str,
    ) -> Result<ModelsResponse, SendError> {
+      let req = self
+         .http
+         .get(format!(
+            "{}/models?client_version={}",
+            self.cfg.base_url.trim_end_matches('/'),
+            self.cfg.version
+         ))
+         .timeout(Duration::from_secs(10));
       let resp = self
-         .models_response(access_token, chatgpt_account_id)
+         .authed(req, access_token, chatgpt_account_id)
+         .send()
          .await?;
-      let resp = classify(resp, Classify::STRICT).await?;
-      let status = resp.status().as_u16();
-      let parsed: ModelsResponse = resp.json().await.map_err(|err| SendError::Upstream {
-         status,
-         body: format!("parsing models response: {err}"),
-      })?;
-      Ok(parsed)
+      json(resp, Classify::STRICT).await
+   }
+
+   /// The standalone web search codex 0.160 calls as a tool, answered as
+   /// one JSON body rather than a stream.
+   pub async fn search(
+      &self,
+      access_token: &str,
+      chatgpt_account_id: &str,
+      req: &Bytes,
+      session_id: &str,
+      model: &str,
+      headers: &header::HeaderMap,
+   ) -> Result<reqwest::Response, SendError> {
+      let url = format!(
+         "{}/alpha/search",
+         self.config().base_url.trim_end_matches('/')
+      );
+      let resp = self
+         .http
+         .post(url)
+         .headers(self.responses_headers(
+            access_token,
+            chatgpt_account_id,
+            session_id,
+            model,
+            headers,
+         )?)
+         .header(header::CONTENT_TYPE, "application/json")
+         .body(req.clone())
+         .send()
+         .await?;
+      classify(resp, RULES).await
+   }
+
+   /// `path` sits under `/backend-api`, one level above the codex base.
+   pub async fn get(
+      &self,
+      access_token: &str,
+      chatgpt_account_id: &str,
+      path: &str,
+   ) -> Result<reqwest::Response, SendError> {
+      let base = self.cfg.base_url.trim_end_matches('/');
+      let root = base.strip_suffix("/codex").unwrap_or(base);
+      let req = self.http.get(format!("{root}{path}"));
+      let resp = self
+         .authed(req, access_token, chatgpt_account_id)
+         .send()
+         .await?;
+      classify(resp, RULES).await
    }
 
    async fn send_once(
@@ -445,8 +425,7 @@ impl CodexClient {
          .send();
       let resp = timeout(RESPONSE_HEADERS_TIMEOUT, request)
          .await
-         .map_err(|_| SendError::Network("timed out waiting for responses headers".into()))?
-         .map_err(|err| SendError::Network(err.to_string()))?;
+         .map_err(|_| SendError::Network("timed out waiting for responses headers".into()))??;
       let resp = classify(resp, RULES).await?;
       refuse_early(resp).await
    }
@@ -507,9 +486,6 @@ mod tests {
          opening(&head(&[created, capacity])),
          Opening::Refused(_)
       ));
-      assert!(is_caller_refusal(r#"{"code":"cyber_policy"}"#));
-      assert!(is_caller_refusal(r#"{"code":"invalid_prompt"}"#));
-      assert!(!is_caller_refusal(r#"{"code":"rate_limit_exceeded"}"#));
       assert!(matches!(opening(&head(&[created, bad])), Opening::Serve));
       assert!(matches!(opening(&head(&[created, failed])), Opening::Serve));
       assert!(matches!(opening(&head(&[created, output])), Opening::Serve));

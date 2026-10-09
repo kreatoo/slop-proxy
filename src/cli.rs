@@ -4,24 +4,24 @@ use eyre::{Result, bail, eyre};
 use pound::Parse;
 
 use crate::clock;
-use crate::codex;
 use crate::codex::client::CodexClient;
 use crate::codex::models::ModelInfo;
 use crate::config::Config;
 use crate::db::Db;
-use crate::db::accounts::AccountStatus;
 use crate::db::accounts::NewAccount;
+use crate::db::accounts::{Account, AccountField, AccountStatus};
 use crate::db::tokens;
 use crate::db::tokens::TokenLimits;
 use crate::oauth;
 use crate::oauth::anthropic;
-use crate::oauth::refresh;
+use crate::oauth::copilot;
+use crate::oauth::glm;
 use crate::pool::codex::CodexPool;
 use crate::provider::{AuthMode, Provider};
 use crate::server;
 use crate::stats;
 
-/// Anthropic/OpenAI API proxy backed by Codex subscription accounts
+/// Anthropic/OpenAI API proxy backed by pooled provider accounts
 #[derive(Parse)]
 #[pound(name = "slop-proxy")]
 pub struct Cli {
@@ -84,12 +84,6 @@ pub enum Command {
    },
    /// List the models available from the codex backend, as JSON
    Models,
-   /// Debug helpers
-   #[pound(hidden)]
-   Debug {
-      #[pound(subcommand)]
-      command: DebugCommand,
-   },
 }
 
 #[derive(Parse)]
@@ -106,11 +100,26 @@ pub enum AccountsCommand {
       label: Option<String>,
       #[pound(long)]
       referer: Option<String>,
+      /// Send this account through the configured egress proxies
+      #[pound(long)]
+      egress: bool,
    },
    /// Remove an account by id or email
    Remove { account: String },
    /// Mark an account as trusted, or clear the flag with --off
    Trust {
+      account: String,
+      #[pound(long)]
+      off: bool,
+   },
+   /// Reserve an account for reserved-only tokens, or release it with --off
+   Reserve {
+      account: String,
+      #[pound(long)]
+      off: bool,
+   },
+   /// Send this account through the configured egress proxies, or direct with --off
+   Egress {
       account: String,
       #[pound(long)]
       off: bool,
@@ -121,6 +130,14 @@ pub enum AccountsCommand {
       #[pound(long)]
       allow: Option<String>,
    },
+   /// Take an account out of service until `enable`
+   Disable {
+      account: String,
+      #[pound(long)]
+      reason: Option<String>,
+   },
+   /// Return a disabled account to service
+   Enable { account: String },
 }
 
 #[derive(Parse)]
@@ -130,10 +147,10 @@ pub enum TokenCommand {
       #[pound(long)]
       user: String,
       /// Maximum requests in each rolling window
-      #[pound(long)]
+      #[pound(long, min = "1")]
       requests: Option<i64>,
       /// Maximum input plus output tokens in each rolling window
-      #[pound(long)]
+      #[pound(long, min = "1")]
       tokens: Option<i64>,
       /// Maximum Codex five-hour quota utilization, such as 50%
       #[pound(long = "5hr-limit")]
@@ -141,14 +158,17 @@ pub enum TokenCommand {
       /// Maximum Codex weekly quota utilization, such as 50%
       #[pound(long)]
       weekly_limit: Option<String>,
-      #[pound(long, default = "3600")]
+      #[pound(long, default = "3600", min = "1")]
       window_seconds: i64,
       /// Delay every admitted request by this many milliseconds
-      #[pound(long, default = "0")]
+      #[pound(long, default = "0", min = "0")]
       slowdown_ms: i64,
       /// Serve this token from trusted accounts when any are available
       #[pound(long)]
       prefer_trusted: bool,
+      /// Serve this token only from reserved accounts
+      #[pound(long)]
+      reserved_only: bool,
       /// Providers this token may reach, comma separated. Empty allows all.
       #[pound(long)]
       providers: Option<String>,
@@ -163,9 +183,9 @@ pub enum TokenCommand {
    /// Replace limits for a token id or prefix; omitted limits are unlimited
    Limits {
       token: String,
-      #[pound(long)]
+      #[pound(long, min = "1")]
       requests: Option<i64>,
-      #[pound(long)]
+      #[pound(long, min = "1")]
       tokens: Option<i64>,
       /// Maximum Codex five-hour quota utilization, such as 50%
       #[pound(long = "5hr-limit")]
@@ -173,12 +193,15 @@ pub enum TokenCommand {
       /// Maximum Codex weekly quota utilization, such as 50%
       #[pound(long)]
       weekly_limit: Option<String>,
-      #[pound(long, default = "3600")]
+      #[pound(long, default = "3600", min = "1")]
       window_seconds: i64,
-      #[pound(long, default = "0")]
+      #[pound(long, default = "0", min = "0")]
       slowdown_ms: i64,
       #[pound(long)]
       prefer_trusted: bool,
+      /// Serve this token only from reserved accounts
+      #[pound(long)]
+      reserved_only: bool,
       /// Providers this token may reach, comma separated. Empty allows all.
       #[pound(long)]
       providers: Option<String>,
@@ -196,46 +219,26 @@ pub enum QuotaCommand {
    Usage {
       #[pound(long)]
       user: String,
-      /// Limit the report to this account, by id, email or label
       #[pound(long)]
       account: Option<String>,
    },
-   /// Show configured fleet budgets and remaining allowance as a table
+   /// Show configured fleet budgets and remaining allowance
    Fleet,
-   /// Show provider-reported quota usage for all accounts as a table
+   /// Show provider-reported quota usage for all accounts
    Accounts,
-   /// Replace both user budgets for an account; omitted budgets are unlimited
+   /// Replace user quota budgets
    Budget {
       #[pound(long)]
       user: String,
-      /// Account id, email or label. Omit to apply percentage budgets across the user's fleet.
       #[pound(long)]
       account: Option<String>,
-      /// User's estimated share of the five-hour allowance, such as 25%
       #[pound(long = "5hr-budget")]
       five_hour_budget: Option<String>,
-      /// User's estimated share of the weekly allowance, such as 25%
       #[pound(long)]
       weekly_budget: Option<String>,
-      /// User's estimated spend budget in US dollars
       #[pound(long)]
       usd_budget: Option<String>,
    },
-}
-
-#[derive(Parse)]
-pub enum DebugCommand {
-   /// Send a raw request upstream and dump the SSE events
-   Ping {
-      #[pound(long)]
-      model: Option<String>,
-      #[pound(long, default = "Say the word: pong")]
-      prompt: String,
-   },
-   /// Force a token refresh for an account
-   Refresh { account: String },
-   /// Dump the raw models endpoint response from the codex backend
-   Models,
 }
 
 pub async fn run(args: Cli, cfg: Config) -> Result<()> {
@@ -245,18 +248,14 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
       Command::Login { label, provider } => match provider {
          Provider::OpenAi => oauth::login(&db, label).await,
          Provider::Anthropic => anthropic::login(&db, label).await,
-         Provider::Gemini => Err(eyre::eyre!(
-            "google has no device-code flow here, use `accounts add-key --provider gemini`"
-         )),
-         Provider::Glm => Err(eyre::eyre!(
-            "z.ai issues static keys, use `accounts add-key --provider glm`"
-         )),
-         Provider::Experiential => Err(eyre::eyre!(
-            "experiential issues static keys, use `accounts add-key --provider experiential`"
-         )),
-         Provider::Zen => Err(eyre::eyre!(
-            "zen serves its free models without a credential, use `accounts add-key --provider zen` if you have one"
-         )),
+         Provider::Copilot => copilot::login(&db, label).await,
+         Provider::Gemini | Provider::DeepSeek | Provider::Experiential | Provider::Zen => {
+            bail!("{provider} has no login flow, use `accounts add-key --provider {provider}`")
+         },
+         Provider::Glm => {
+            let key = glm::login().await?;
+            accounts_add_key(&db, Provider::Glm, &key, label.as_deref(), None, false).await
+         },
       },
       Command::Accounts { command } => match command {
          AccountsCommand::List => accounts_list(&db).await,
@@ -265,11 +264,57 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             key,
             label,
             referer,
-         } => accounts_add_key(&db, provider, &key, label.as_deref(), referer.as_deref()).await,
+            egress,
+         } => {
+            accounts_add_key(
+               &db,
+               provider,
+               &key,
+               label.as_deref(),
+               referer.as_deref(),
+               egress,
+            )
+            .await
+         },
          AccountsCommand::Remove { account } => accounts_remove(&db, &account).await,
-         AccountsCommand::Trust { account, off } => accounts_trust(&db, &account, !off).await,
+         AccountsCommand::Trust { account, off } => {
+            accounts_toggle(
+               &db,
+               &account,
+               AccountField::Trusted,
+               !off,
+               ["trusted", "untrusted"],
+            )
+            .await
+         },
+         AccountsCommand::Reserve { account, off } => {
+            accounts_toggle(
+               &db,
+               &account,
+               AccountField::Reserved,
+               !off,
+               ["reserved", "unreserved"],
+            )
+            .await
+         },
+         AccountsCommand::Egress { account, off } => {
+            accounts_toggle(
+               &db,
+               &account,
+               AccountField::Egress,
+               !off,
+               ["egressed", "direct"],
+            )
+            .await
+         },
          AccountsCommand::Users { account, allow } => {
             accounts_users(&db, &account, allow.as_deref().unwrap_or_default()).await
+         },
+         AccountsCommand::Disable { account, reason } => {
+            accounts_status(&db, &account, AccountStatus::Disabled, reason.as_deref()).await
+         },
+         AccountsCommand::Enable { account } => {
+            accounts_status(&db, &account, AccountStatus::Active, None).await
          },
       },
       Command::Token { command } => match command {
@@ -282,6 +327,7 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             window_seconds,
             slowdown_ms,
             prefer_trusted,
+            reserved_only,
             providers,
             pin_account,
          } => {
@@ -293,6 +339,7 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
                window_seconds,
                slowdown_ms,
                prefer_trusted,
+               reserved_only,
                providers,
                resolve_pin(&db, pin_account).await?,
             )?;
@@ -309,6 +356,7 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
             window_seconds,
             slowdown_ms,
             prefer_trusted,
+            reserved_only,
             providers,
             pin_account,
          } => {
@@ -320,6 +368,7 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
                window_seconds,
                slowdown_ms,
                prefer_trusted,
+               reserved_only,
                providers,
                resolve_pin(&db, pin_account).await?,
             )?;
@@ -337,11 +386,6 @@ pub async fn run(args: Cli, cfg: Config) -> Result<()> {
       },
       Command::Stats { since, until } => stats::run(&db, since, until).await,
       Command::Models => models(&db, &cfg).await,
-      Command::Debug { command } => match command {
-         DebugCommand::Ping { model, prompt } => codex::debug_ping(&db, &cfg, model, prompt).await,
-         DebugCommand::Refresh { account } => debug_refresh(&db, &account).await,
-         DebugCommand::Models => codex::debug_models(&db, &cfg).await,
-      },
    }
 }
 
@@ -354,16 +398,24 @@ async fn accounts_add_key(
    key: &str,
    label: Option<&str>,
    referer: Option<&str>,
+   egress: bool,
 ) -> Result<()> {
    if referer.is_some() && provider != Provider::Gemini {
       bail!("--referer is only supported for gemini keys");
    }
-   let mut hasher = hmac_sha256::Hash::new();
-   hasher.update(key.as_bytes());
-   let account_id = data_encoding::HEXLOWER.encode(&hasher.finalize()[..8]);
+   let (account_id, email, refresh_token, auth_mode, token) = if provider == Provider::Copilot {
+      let token = key.trim();
+      let login = copilot::github_login(token).await?;
+      (login.clone(), Some(login), token, AuthMode::OAuth, token)
+   } else {
+      let mut hasher = hmac_sha256::Hash::new();
+      hasher.update(key.as_bytes());
+      let hash = data_encoding::HEXLOWER.encode(&hasher.finalize()[..8]);
+      (hash, None, "", AuthMode::ApiKey, key)
+   };
    let tokens = oauth::TokenSet {
-      access_token: key.to_owned(),
-      refresh_token: String::new(),
+      access_token: token.to_owned(),
+      refresh_token: refresh_token.to_owned(),
       id_token: None,
       expires_at: None,
    };
@@ -371,16 +423,20 @@ async fn accounts_add_key(
       .upsert_account(NewAccount {
          provider,
          id: &account_id,
-         email: None,
+         email: email.as_deref(),
          label,
          plan: None,
          tokens: &tokens,
-         auth_mode: AuthMode::ApiKey,
+         auth_mode,
       })
       .await?;
    if let Some(referer) = referer {
-      let referer = (!referer.is_empty()).then_some(referer);
-      db.set_account_http_referer(id, referer).await?;
+      let referer = (!referer.is_empty()).then(|| referer.to_owned());
+      db.set_account(id, AccountField::HttpReferer(referer))
+         .await?;
+   }
+   if egress {
+      db.set_account(id, AccountField::Egress(true)).await?;
    }
    println!("stored {provider} account {id} ({account_id})");
    Ok(())
@@ -393,6 +449,8 @@ async fn accounts_list(db: &Db) -> Result<()> {
       id: i64,
       provider: &'a str,
       trusted: bool,
+      reserved: bool,
+      egress: bool,
       email: Option<&'a str>,
       plan_type: Option<&'a str>,
       status: &'static str,
@@ -410,6 +468,8 @@ async fn accounts_list(db: &Db) -> Result<()> {
          id: account.id,
          provider: account.provider.as_str(),
          trusted: account.trusted,
+         reserved: account.reserved,
+         egress: account.egress,
          email: account.email.as_deref(),
          plan_type: account.plan_type.as_deref(),
          status: account.status.as_str(),
@@ -425,14 +485,35 @@ async fn accounts_list(db: &Db) -> Result<()> {
    Ok(())
 }
 
-async fn accounts_trust(db: &Db, account: &str, trusted: bool) -> Result<()> {
-   if db.set_account_trusted(account, trusted).await? == 0 {
-      bail!("no account matched {account:?}");
-   }
-   println!(
-      "account {account} is now {}",
-      if trusted { "trusted" } else { "untrusted" }
-   );
+async fn lookup(db: &Db, key: &str) -> Result<Account> {
+   db.find_account(key)
+      .await?
+      .ok_or_else(|| eyre!("no account matched {key:?}"))
+}
+
+async fn accounts_toggle(
+   db: &Db,
+   key: &str,
+   field: fn(bool) -> AccountField,
+   enabled: bool,
+   words: [&str; 2],
+) -> Result<()> {
+   let found = lookup(db, key).await?;
+   db.set_account(found.id, field(enabled)).await?;
+   println!("account {key} is now {}", words[usize::from(!enabled)]);
+   Ok(())
+}
+
+async fn accounts_status(
+   db: &Db,
+   account: &str,
+   status: AccountStatus,
+   reason: Option<&str>,
+) -> Result<()> {
+   let found = lookup(db, account).await?;
+   db.set_account_status(found.id, status, None, reason)
+      .await?;
+   println!("account {account} is now {}", status.as_str());
    Ok(())
 }
 
@@ -442,13 +523,9 @@ async fn accounts_users(db: &Db, account: &str, allow: &str) -> Result<()> {
       .map(str::trim)
       .filter(|user| !user.is_empty())
       .collect();
-   if db
-      .set_account_allowed_users(account, &users.join(","))
-      .await?
-      == 0
-   {
-      bail!("no account matched {account:?}");
-   }
+   let found = lookup(db, account).await?;
+   db.set_account(found.id, AccountField::AllowedUsers(users.join(",")))
+      .await?;
    if users.is_empty() {
       println!("account {account} is now open to every user");
    } else {
@@ -458,10 +535,8 @@ async fn accounts_users(db: &Db, account: &str, allow: &str) -> Result<()> {
 }
 
 async fn accounts_remove(db: &Db, account: &str) -> Result<()> {
-   let count = db.remove_account(account).await?;
-   if count == 0 {
-      bail!("no account matched {account:?}");
-   }
+   let found = lookup(db, account).await?;
+   let count = db.remove_account(found.id).await?;
    println!("removed {count} account(s)");
    Ok(())
 }
@@ -481,12 +556,13 @@ async fn resolve_pin(db: &Db, account: Option<String>) -> Result<Option<i64>> {
    let Some(key) = account else {
       return Ok(None);
    };
-   let Some(found) = db.find_account(&key).await? else {
-      bail!("no account matched {key:?}");
-   };
-   Ok(Some(found.id))
+   Ok(Some(lookup(db, &key).await?.id))
 }
 
+#[expect(
+   clippy::too_many_arguments,
+   reason = "both token subcommands hand over the same set of flags"
+)]
 fn token_limits(
    requests: Option<i64>,
    tokens: Option<i64>,
@@ -495,34 +571,21 @@ fn token_limits(
    window_seconds: i64,
    slowdown_ms: i64,
    prefer_trusted: bool,
+   reserved_only: bool,
    providers: Option<String>,
    pinned_account: Option<i64>,
 ) -> Result<TokenLimits> {
-   if requests.is_some_and(|value| value <= 0) {
-      bail!("--requests must be greater than zero");
-   }
-   if tokens.is_some_and(|value| value <= 0) {
-      bail!("--tokens must be greater than zero");
-   }
-   if window_seconds <= 0 {
-      bail!("--window-seconds must be greater than zero");
-   }
-   if slowdown_ms < 0 {
-      bail!("--slowdown-ms cannot be negative");
-   }
-   let five_hour_limit = parse_percentage(five_hour_limit, "--5hr-limit")?;
-   let weekly_limit = parse_percentage(weekly_limit, "--weekly-limit")?;
    let providers = providers
       .filter(|csv| !csv.trim().is_empty())
       .map(|raw| {
          raw.split(',')
-            .map(|part| {
-               Provider::from_str(part).ok_or_else(|| eyre::eyre!("unknown provider: {part}"))
-            })
+            .map(|part| part.parse::<Provider>().map_err(eyre::Report::msg))
             .collect::<Result<Vec<_>>>()
       })
       .transpose()?
       .unwrap_or_default();
+   let five_hour_limit = parse_percentage(five_hour_limit, "--5hr-limit")?;
+   let weekly_limit = parse_percentage(weekly_limit, "--weekly-limit")?;
    Ok(TokenLimits {
       requests,
       tokens,
@@ -531,6 +594,7 @@ fn token_limits(
       five_hour_limit,
       weekly_limit,
       prefer_trusted,
+      reserved_only,
       pinned_account,
       providers,
    })
@@ -851,546 +915,4 @@ async fn models(db: &Db, cfg: &Config) -> Result<()> {
       .collect::<Vec<_>>();
    println!("{}", serde_json::to_string_pretty(&arr)?);
    Ok(())
-}
-
-async fn debug_refresh(db: &Db, account: &str) -> Result<()> {
-   let acc = db
-      .find_account(account)
-      .await?
-      .ok_or_else(|| eyre!("no account matched"))?;
-   let tokens = match acc.provider {
-      Provider::OpenAi => refresh::refresh(&acc.refresh_token).await?,
-      Provider::Anthropic => anthropic::refresh(&acc.refresh_token).await?,
-      Provider::Gemini | Provider::Zen | Provider::Glm | Provider::Experiential => {
-         bail!("this provider has no refresh flow")
-      },
-   };
-   db.update_account_tokens(acc.id, &tokens).await?;
-   println!(
-      "refreshed account {} ({})",
-      acc.id,
-      acc.email.as_deref().unwrap_or("-")
-   );
-   Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-   use super::{
-      Cli, Command, QuotaCommand, TokenCommand, parse_percentage, parse_usd_budget, quota_budgets,
-   };
-   use super::{Db, NewAccount, TokenLimits, quota_command};
-   use std::env;
-
-   use crate::config::Config;
-   use crate::db::quota::QuotaObservation;
-   use crate::oauth::TokenSet;
-   use crate::provider::{AuthMode, Provider};
-   use pound::Parse as _;
-
-   async fn quota_test_database() -> (Db, i64) {
-      let path = env::temp_dir().join(format!("slop-cli-{}.db", uuid::Uuid::new_v4()));
-      let db = Db::open(&path).unwrap();
-      let account = db
-         .upsert_account(NewAccount {
-            provider: Provider::OpenAi,
-            id: "quota-cli-account",
-            email: Some("quota@example.com"),
-            label: Some("personal"),
-            plan: None,
-            tokens: &TokenSet {
-               access_token: "unused".into(),
-               refresh_token: "unused".into(),
-               id_token: None,
-               expires_at: None,
-            },
-            auth_mode: AuthMode::OAuth,
-         })
-         .await
-         .unwrap();
-      (db, account)
-   }
-
-   async fn dispatch_quota(db: &Db, args: &[&str]) -> eyre::Result<String> {
-      let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
-      let cfg = Config::load(&cli).unwrap();
-      let Command::Quota { command } = cli.command else {
-         panic!("expected quota command");
-      };
-      quota_command(db, &cfg, command).await
-   }
-
-   #[tokio::test]
-   async fn quota_dispatch_replaces_budgets_without_changing_token_limits() {
-      let (db, account) = quota_test_database().await;
-      let token = db.create_token("kader", "cli-secret", "cli").await.unwrap();
-      db.set_token_limits(
-         &token.to_string(),
-         &TokenLimits {
-            requests: Some(60),
-            tokens: Some(100_000),
-            window_seconds: 3600,
-            slowdown_ms: 250,
-            five_hour_limit: Some(0.5_f64),
-            weekly_limit: Some(0.75_f64),
-            prefer_trusted: true,
-            pinned_account: Some(account),
-            providers: vec![Provider::OpenAi],
-         },
-      )
-      .await
-      .unwrap();
-      dispatch_quota(
-         &db,
-         &[
-            "quota",
-            "budget",
-            "--user",
-            "kader",
-            "--account",
-            "personal",
-            "--5hr-budget",
-            "25%",
-            "--weekly-budget",
-            "12.5%",
-            "--usd-budget",
-            "400",
-         ],
-      )
-      .await
-      .unwrap();
-      let rows = db.user_quota("kader", Some(account)).await.unwrap();
-      assert_eq!(rows.len(), 2);
-      assert_eq!(
-         (rows[0].window_seconds, rows[0].budget_percent),
-         (18000, Some(25.0_f64))
-      );
-      assert_eq!(
-         (rows[1].window_seconds, rows[1].budget_percent),
-         (604_800, Some(12.5_f64))
-      );
-      assert!(rows.iter().all(|row| row.spend_budget_usd == Some(400.0)));
-
-      // An invalid second value must not replace the valid first budget.
-      let _ = dispatch_quota(
-         &db,
-         &[
-            "quota",
-            "budget",
-            "--user",
-            "kader",
-            "--account",
-            "personal",
-            "--5hr-budget",
-            "80%",
-            "--weekly-budget",
-            "101%",
-         ],
-      )
-      .await
-      .unwrap_err();
-      assert_eq!(
-         db.user_quota("kader", Some(account)).await.unwrap()[0].budget_percent,
-         Some(25.0_f64)
-      );
-
-      dispatch_quota(
-         &db,
-         &[
-            "quota",
-            "budget",
-            "--user",
-            "kader",
-            "--account",
-            "quota@example.com",
-            "--5hr-budget",
-            "30%",
-         ],
-      )
-      .await
-      .unwrap();
-      let replaced_rows = db.user_quota("kader", Some(account)).await.unwrap();
-      assert_eq!(replaced_rows.len(), 1);
-      assert_eq!(replaced_rows[0].budget_percent, Some(30.0_f64));
-      dispatch_quota(
-         &db,
-         &[
-            "quota",
-            "budget",
-            "--user",
-            "kader",
-            "--account",
-            &account.to_string(),
-         ],
-      )
-      .await
-      .unwrap();
-      assert!(
-         db.user_quota("kader", Some(account))
-            .await
-            .unwrap()
-            .is_empty()
-      );
-
-      let limits = db.auth_token("cli-secret").await.unwrap().unwrap().limits;
-      assert_eq!(limits.requests, Some(60));
-      assert_eq!(limits.tokens, Some(100_000));
-      assert_eq!(limits.window_seconds, 3600);
-      assert_eq!(limits.slowdown_ms, 250);
-      assert_eq!(limits.five_hour_limit, Some(0.5_f64));
-      assert_eq!(limits.weekly_limit, Some(0.75_f64));
-      assert!(limits.prefer_trusted);
-      assert_eq!(limits.pinned_account, Some(account));
-      assert_eq!(limits.providers, vec![Provider::OpenAi]);
-   }
-
-   #[tokio::test]
-   async fn quota_dispatch_without_account_sets_fleet_percentage_budgets() {
-      let (db, account) = quota_test_database().await;
-      dispatch_quota(
-         &db,
-         &[
-            "quota",
-            "budget",
-            "--user",
-            "kader",
-            "--5hr-budget",
-            "50%",
-            "--weekly-budget",
-            "25%",
-         ],
-      )
-      .await
-      .unwrap();
-      let rows = db.user_quota("kader", None).await.unwrap();
-      let fleet = rows
-         .iter()
-         .find(|row| row.account_id.is_none())
-         .expect("fleet row");
-      assert_eq!(fleet.window_seconds, 18_000);
-      assert_eq!(fleet.budget_percent, Some(50.0));
-      assert_eq!(fleet.fleet_capacity_points, Some(0.0));
-      assert!(rows.iter().all(|row| row.account_id != Some(account)));
-
-      // Cross-flag validation happens before replacing either fleet window.
-      let error = dispatch_quota(
-         &db,
-         &[
-            "quota",
-            "budget",
-            "--user",
-            "kader",
-            "--5hr-budget",
-            "80%",
-            "--usd-budget",
-            "400",
-         ],
-      )
-      .await
-      .unwrap_err()
-      .to_string();
-      assert!(error.contains("--usd-budget requires --account"), "{error}");
-      assert_eq!(
-         db.user_quota("kader", None)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|row| row.account_id.is_none() && row.window_seconds == 18_000)
-            .and_then(|row| row.budget_percent),
-         Some(50.0)
-      );
-   }
-
-   #[tokio::test]
-   async fn quota_fleet_dispatch_formats_remaining_allowance() {
-      let (db, account) = quota_test_database().await;
-      let now = crate::clock::unix_now();
-      db.observe_quota(QuotaObservation {
-         account_id: account,
-         window_seconds: 604_800,
-         resets_at: now + 604_800,
-         used_percent: 20.0_f64,
-         observed_at: now,
-      })
-      .await
-      .unwrap();
-      dispatch_quota(
-         &db,
-         &[
-            "quota",
-            "budget",
-            "--user",
-            "kader",
-            "--weekly-budget",
-            "50%",
-         ],
-      )
-      .await
-      .unwrap();
-      let table = dispatch_quota(&db, &["quota", "fleet"]).await.unwrap();
-      assert!(table.contains("USER"));
-      assert!(table.contains("ALLOWANCE"));
-      assert!(table.lines().any(|line| {
-         line.contains("kader")
-            && line.contains("WEEKLY")
-            && line.contains("50%")
-            && line.contains("40")
-            && line.contains("100%")
-      }));
-      assert!(table.contains("Plus 1x, Prolite 5x, Pro 20x"));
-   }
-
-   #[tokio::test]
-   async fn quota_usage_dispatch_serializes_unknown_observations_as_null() {
-      let (db, account) = quota_test_database().await;
-      let empty = dispatch_quota(&db, &["quota", "usage", "--user", "kader"])
-         .await
-         .unwrap();
-      assert_eq!(
-         serde_json::from_str::<serde_json::Value>(&empty).unwrap(),
-         serde_json::json!([])
-      );
-      db.set_user_quota_budget("kader", account, 18000, Some(25.0_f64))
-         .await
-         .unwrap();
-      let json = dispatch_quota(
-         &db,
-         &["quota", "usage", "--user", "kader", "--account", "personal"],
-      )
-      .await
-      .unwrap();
-      let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
-      assert_eq!(rows[0]["account_id"], account);
-      assert_eq!(rows[0]["user"], "kader");
-      assert_eq!(rows[0]["budget_percent"], 25.0_f64);
-      assert_eq!(rows[0]["estimated"], true);
-      assert!(rows[0]["observed_used_percent"].is_null());
-      assert!(rows[0]["resets_at"].is_null());
-      assert!(rows[0]["allowance_used_percent"].is_null());
-      let _ = dispatch_quota(
-         &db,
-         &["quota", "usage", "--user", "kader", "--account", "missing"],
-      )
-      .await
-      .unwrap_err();
-   }
-
-   #[test]
-   fn quota_usage_accepts_optional_account() {
-      for account in [None, Some("1"), Some("kader@example.com"), Some("personal")] {
-         let mut args = vec!["quota", "usage", "--user", "kader"];
-         if let Some(account) = account {
-            args.extend(["--account", account]);
-         }
-         let cli = Cli::try_parse_from(args).unwrap();
-         let Command::Quota {
-            command:
-               QuotaCommand::Usage {
-                  user,
-                  account: parsed,
-               },
-         } = cli.command
-         else {
-            panic!("expected quota usage");
-         };
-         assert_eq!(user, "kader");
-         assert_eq!(parsed.as_deref(), account);
-      }
-   }
-
-   #[test]
-   fn quota_budget_accepts_percentage_flags() {
-      let cli = Cli::try_parse_from([
-         "quota",
-         "budget",
-         "--user",
-         "kader",
-         "--account",
-         "personal",
-         "--5hr-budget",
-         "25%",
-         "--weekly-budget",
-         "12.5%",
-      ])
-      .unwrap();
-      let Command::Quota {
-         command:
-            QuotaCommand::Budget {
-               user,
-               account,
-               five_hour_budget,
-               weekly_budget,
-               usd_budget,
-            },
-      } = cli.command
-      else {
-         panic!("expected quota budget");
-      };
-      assert_eq!(user, "kader");
-      assert_eq!(account.as_deref(), Some("personal"));
-      assert_eq!(usd_budget, None);
-      assert_eq!(
-         quota_budgets(five_hour_budget, weekly_budget).unwrap(),
-         (Some(25.0_f64), Some(12.5_f64))
-      );
-   }
-
-   #[test]
-   fn quota_budget_omitted_windows_are_unlimited() {
-      let cli =
-         Cli::try_parse_from(["quota", "budget", "--user", "kader", "--account", "1"]).unwrap();
-      let Command::Quota {
-         command:
-            QuotaCommand::Budget {
-               five_hour_budget,
-               weekly_budget,
-               usd_budget,
-               ..
-            },
-      } = cli.command
-      else {
-         panic!("expected quota budget");
-      };
-      assert_eq!(usd_budget, None);
-      assert_eq!(
-         quota_budgets(five_hour_budget, weekly_budget).unwrap(),
-         (None, None)
-      );
-      assert_eq!(
-         quota_budgets(Some("25%".into()), None).unwrap(),
-         (Some(25.0_f64), None)
-      );
-      assert_eq!(
-         quota_budgets(None, Some("25%".into())).unwrap(),
-         (None, Some(25.0_f64))
-      );
-   }
-
-   #[test]
-   fn quota_budget_accepts_finite_nonnegative_usd_amounts() {
-      for (raw, expected) in [("0", 0.0), ("400", 400.0), ("12.50", 12.5), ("$400", 400.0)] {
-         assert_eq!(
-            parse_usd_budget(Some(raw.into()), "--usd-budget").unwrap(),
-            Some(expected)
-         );
-      }
-      assert_eq!(parse_usd_budget(None, "--usd-budget").unwrap(), None);
-      for raw in ["-1", "NaN", "inf", "$", "$-1", "garbage"] {
-         assert!(parse_usd_budget(Some(raw.into()), "--usd-budget").is_err());
-      }
-   }
-
-   #[test]
-   fn quota_budget_requires_usd_amount_when_flag_is_present() {
-      let cli = Cli::try_parse_from([
-         "quota",
-         "budget",
-         "--user",
-         "kader",
-         "--account",
-         "personal",
-         "--usd-budget",
-         "$400",
-      ])
-      .unwrap();
-      let Command::Quota {
-         command: QuotaCommand::Budget { usd_budget, .. },
-      } = cli.command
-      else {
-         panic!("expected quota budget");
-      };
-      assert_eq!(
-         parse_usd_budget(usd_budget, "--usd-budget").unwrap(),
-         Some(400.0)
-      );
-   }
-
-   #[test]
-   fn quota_commands_require_user_but_budget_account_is_optional() {
-      assert!(Cli::try_parse_from(["quota", "usage"]).is_err());
-      assert!(Cli::try_parse_from(["quota", "budget", "--account", "1"]).is_err());
-      let cli = Cli::try_parse_from(["quota", "budget", "--user", "kader"]).unwrap();
-      let Command::Quota {
-         command: QuotaCommand::Budget { account, .. },
-      } = cli.command
-      else {
-         panic!("expected quota budget");
-      };
-      assert_eq!(account, None);
-   }
-
-   #[test]
-   fn quota_budget_rejects_usd_without_account_before_dispatch() {
-      let cli = Cli::try_parse_from(["quota", "budget", "--user", "kader", "--usd-budget", "400"])
-         .unwrap();
-      let Command::Quota { command } = cli.command else {
-         panic!("expected quota");
-      };
-      // Dispatch performs this cross-flag validation because the parser accepts
-      // each flag independently.
-      assert!(matches!(
-         command,
-         QuotaCommand::Budget {
-            account: None,
-            usd_budget: Some(_),
-            ..
-         }
-      ));
-   }
-
-   #[test]
-   fn quota_budgets_accept_only_bounded_finite_percentages() {
-      assert_eq!(
-         quota_budgets(Some("0%".into()), Some("100%".into())).unwrap(),
-         (Some(0.0_f64), Some(100.0_f64))
-      );
-      for value in ["25", "101%", "-1%", "NaN%", "inf%", "garbage%"] {
-         let _ = quota_budgets(Some(value.into()), None).unwrap_err();
-         let _ = quota_budgets(None, Some(value.into())).unwrap_err();
-      }
-   }
-
-   #[test]
-   fn token_create_accepts_codex_percentage_flags() {
-      let cli = Cli::try_parse_from([
-         "token",
-         "create",
-         "--user",
-         "alice",
-         "--5hr-limit",
-         "50%",
-         "--weekly-limit",
-         "50%",
-      ])
-      .unwrap();
-      let Command::Token {
-         command:
-            TokenCommand::Create {
-               five_hour_limit,
-               weekly_limit,
-               ..
-            },
-      } = cli.command
-      else {
-         panic!("expected token create");
-      };
-      assert_eq!(five_hour_limit.as_deref(), Some("50%"));
-      assert_eq!(weekly_limit.as_deref(), Some("50%"));
-   }
-
-   #[test]
-   fn codex_percentages_are_stored_as_fractions() {
-      assert_eq!(
-         parse_percentage(Some("50%".into()), "--5hr-limit").unwrap(),
-         Some(0.5)
-      );
-      assert_eq!(parse_percentage(None, "--5hr-limit").unwrap(), None);
-   }
-
-   #[test]
-   fn codex_percentages_must_be_bounded_and_marked() {
-      assert!(parse_percentage(Some("50".into()), "--weekly-limit").is_err());
-      assert!(parse_percentage(Some("101%".into()), "--weekly-limit").is_err());
-      assert!(parse_percentage(Some("-1%".into()), "--weekly-limit").is_err());
-   }
 }

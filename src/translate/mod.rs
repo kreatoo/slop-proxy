@@ -1,9 +1,9 @@
 pub mod anthropic_req;
 pub mod anthropic_stream;
+pub mod bridge;
 pub mod chat;
+pub mod chat_req;
 pub mod count_tokens;
-pub mod gemini_bridge;
-pub mod gemini_req;
 pub mod model_map;
 pub mod openai_req;
 pub mod openai_stream;
@@ -23,12 +23,41 @@ use serde_json::value::{RawValue, to_raw_value};
 
 use crate::codex::sse::EventStream;
 use crate::codex::types::{
-   OutputContentPart, OutputItem, ResponsesEvent, SummaryPart, TerminalKind, TokenDetails, Usage,
+   OutputContentPart, OutputItem, ReasoningConfig, ResponsesEvent, ResponsesRequest, SummaryPart,
+   TerminalKind, Usage,
 };
+use crate::config::Config;
 
 /// Zen's upstream 400s `max_output_tokens` below 16, and `CodexClient::post`
 /// already salvages that by stripping the field rather than clamping it.
 pub const MIN_MAX_OUTPUT_TOKENS: u64 = 16;
+
+pub fn empty_schema() -> Box<RawValue> {
+   to_raw_value(&serde_json::json!({"type": "object", "properties": {}}))
+      .expect("schema serializes")
+}
+
+pub fn responses_request(
+   cfg: &Config,
+   model: &str,
+   effort: Option<String>,
+   cap: Option<u64>,
+) -> ResponsesRequest {
+   let resolved = model_map::resolve(&cfg.models, model);
+   let mut out = ResponsesRequest::new(resolved.model, cfg.codex.instructions());
+   out.service_tier = resolved.service_tier;
+   let effort = effort
+      .or(resolved.effort)
+      .unwrap_or_else(|| "medium".into());
+   out.reasoning = Some(ReasoningConfig {
+      effort: model_map::clamp_effort(&out.model, &effort),
+      summary: "auto".into(),
+   });
+   if cfg.codex.forward_max_tokens {
+      out.max_output_tokens = usable_cap(cap);
+   }
+   out
+}
 
 /// A cap the upstream will accept, or `None` to leave the field off entirely.
 pub fn usable_cap(cap: Option<u64>) -> Option<u64> {
@@ -72,14 +101,14 @@ pub fn encode_signature(id: Option<&str>, encrypted_content: &str) -> String {
    BASE64URL_NOPAD.encode(payload.as_bytes())
 }
 
-pub fn decode_signature(sig: &str) -> (Option<String>, Option<String>) {
+pub fn decode_signature(sig: &str) -> (Option<String>, String) {
    if let Ok(bytes) = BASE64URL_NOPAD.decode(sig.as_bytes())
-      && let Ok(payload) = serde_json::from_slice::<SignaturePayload>(&bytes)
-      && payload.encrypted_content.is_some()
+      && let Ok(mut payload) = serde_json::from_slice::<SignaturePayload>(&bytes)
+      && let Some(encrypted_content) = payload.encrypted_content.take()
    {
-      return (payload.id, payload.encrypted_content);
+      return (payload.id, encrypted_content);
    }
-   (None, Some(sig.to_owned()))
+   (None, sig.to_owned())
 }
 
 #[derive(Default, Debug, Clone)]
@@ -96,6 +125,11 @@ pub struct CapturedUsage {
    pub last_event: Option<String>,
    /// Separates a slow account from a long answer, which one duration cannot.
    pub first_byte_at: Option<Instant>,
+   /// How long upstream had been silent when it quit, which separates an
+   /// idle timer somewhere in the path from an abort mid-answer.
+   pub last_byte_at: Option<Instant>,
+   /// Which zen proxy carried this, to tell one rotten egress from all 250.
+   pub egress: Option<usize>,
    pub response_bytes: i64,
    pub stop_reason: Option<String>,
    /// Names only. An argument is the caller's shell command or source.
@@ -166,6 +200,7 @@ impl UsageCapture {
       let mut captured = self.0.lock().unwrap();
       captured.last_event = Some(name.to_owned());
       captured.first_byte_at.get_or_insert_with(Instant::now);
+      captured.last_byte_at = Some(Instant::now());
    }
 
    pub fn note_bytes(&self, len: usize) {
@@ -175,6 +210,11 @@ impl UsageCapture {
       let mut captured = self.0.lock().unwrap();
       captured.response_bytes += len as i64;
       captured.first_byte_at.get_or_insert_with(Instant::now);
+      captured.last_byte_at = Some(Instant::now());
+   }
+
+   pub fn note_egress(&self, index: usize) {
+      self.0.lock().unwrap().egress = Some(index);
    }
 
    pub fn note_stop_reason(&self, reason: &str) {
@@ -233,6 +273,21 @@ pub enum Block {
    },
 }
 
+impl Block {
+   const fn thinking() -> Self {
+      Self::Thinking {
+         text: String::new(),
+         signature: None,
+      }
+   }
+
+   const fn text() -> Self {
+      Self::Text {
+         text: String::new(),
+      }
+   }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopKind {
    EndTurn,
@@ -250,6 +305,14 @@ impl StopKind {
          Self::Error => "error",
       }
    }
+
+   pub const fn chat_finish_reason(self) -> chat::FinishReason {
+      match self {
+         Self::ToolUse => chat::FinishReason::ToolCalls,
+         Self::MaxTokens => chat::FinishReason::Length,
+         Self::EndTurn | Self::Error => chat::FinishReason::Stop,
+      }
+   }
 }
 
 #[derive(Debug)]
@@ -259,7 +322,6 @@ pub struct Aggregated {
    pub stop: StopKind,
    pub usage: Usage,
    pub error_message: Option<String>,
-   pub completed: bool,
 }
 
 pub enum Step {
@@ -293,7 +355,6 @@ struct TrackedBlock {
    closed: bool,
 }
 
-/// The one state machine every consumer of a Responses stream shares.
 pub struct Walker {
    blocks: BTreeMap<(u64, u64), TrackedBlock>,
    saw_tool: bool,
@@ -320,14 +381,9 @@ impl Walker {
       match event {
          ResponsesEvent::Created { response } => out.push(Step::Start { id: response.id }),
          ResponsesEvent::OutputItemAdded { output_index, item } => match item {
-            OutputItem::Reasoning { .. } => self.open(
-               &mut out,
-               (output_index, 0),
-               Block::Thinking {
-                  text: String::new(),
-                  signature: None,
-               },
-            ),
+            OutputItem::Reasoning { .. } => {
+               self.open(&mut out, (output_index, 0), Block::thinking());
+            },
             OutputItem::FunctionCall { call_id, name, .. } => {
                self.open(
                   &mut out,
@@ -359,14 +415,7 @@ impl Walker {
             output_index,
             delta,
          } => {
-            self.open(
-               &mut out,
-               (output_index, 0),
-               Block::Thinking {
-                  text: String::new(),
-                  signature: None,
-               },
-            );
+            self.open(&mut out, (output_index, 0), Block::thinking());
             self.append(&mut out, (output_index, 0), delta);
          },
          ResponsesEvent::OutputTextDelta {
@@ -376,13 +425,7 @@ impl Walker {
             ..
          } => {
             let key = (output_index, content_index);
-            self.open(
-               &mut out,
-               key,
-               Block::Text {
-                  text: String::new(),
-               },
-            );
+            self.open(&mut out, key, Block::text());
             self.append(&mut out, key, delta);
          },
          ResponsesEvent::FunctionCallArgumentsDelta {
@@ -439,20 +482,17 @@ impl Walker {
             encrypted_content,
          } => {
             let key = (output_index, 0);
-            self.open(
-               out,
-               key,
-               Block::Thinking {
-                  text: String::new(),
-                  signature: None,
-               },
-            );
-            let text = summary
-               .unwrap_or_default()
-               .iter()
-               .map(|&SummaryPart::SummaryText { ref text }| text.as_str())
-               .collect::<Vec<_>>()
-               .join("\n\n");
+            self.open(out, key, Block::thinking());
+            let mut text = String::new();
+            if let Some(parts) = summary {
+               for (index, part) in parts.into_iter().enumerate() {
+                  let SummaryPart::SummaryText { text: part_text } = part;
+                  if index > 0 {
+                     text.push_str("\n\n");
+                  }
+                  text.push_str(&part_text);
+               }
+            }
             if !self.blocks[&key].seen && !text.is_empty() {
                self.append(out, key, text);
             }
@@ -468,26 +508,20 @@ impl Walker {
             for (content_index, part) in content.unwrap_or_default().into_iter().enumerate() {
                if let OutputContentPart::OutputText { text } = part {
                   let key = (output_index, content_index as u64);
-                  self.open(
-                     out,
-                     key,
-                     Block::Text {
-                        text: String::new(),
-                     },
-                  );
+                  self.open(out, key, Block::text());
                   if !self.blocks[&key].seen {
                      self.append(out, key, text);
                   }
                }
             }
-            let keys: Vec<_> = self
-               .blocks
-               .keys()
-               .filter(|key| key.0 == output_index)
-               .copied()
-               .collect();
-            for key in keys {
-               self.close(out, key);
+            for (&key, block) in &mut self.blocks {
+               if key.0 == output_index && !block.closed {
+                  block.closed = true;
+                  out.push(Step::Block {
+                     index: block.index,
+                     event: BlockEvent::Close,
+                  });
+               }
             }
          },
          OutputItem::FunctionCall {
@@ -580,27 +614,7 @@ impl Walker {
             event: BlockEvent::Close,
          });
       }
-      let usage = usage.unwrap_or_else(|| {
-         let snapshot = self.capture.snapshot();
-         let input_tokens = snapshot
-            .input_tokens
-            .saturating_add(snapshot.cache_read_tokens)
-            .saturating_add(snapshot.cache_write_tokens);
-         Usage {
-            input_tokens,
-            output_tokens: snapshot.output_tokens,
-            total_tokens: input_tokens.saturating_add(snapshot.output_tokens),
-            input_tokens_details: TokenDetails {
-               cached_tokens: snapshot.cache_read_tokens,
-               cache_write_tokens: snapshot.cache_write_tokens,
-               ..Default::default()
-            },
-            output_tokens_details: TokenDetails {
-               reasoning_tokens: snapshot.reasoning_tokens,
-               ..Default::default()
-            },
-         }
-      });
+      let usage = usage.unwrap_or_default();
       self.capture.note_stop_reason(kind.as_str());
       self.done = true;
       out.push(Step::Stop { kind, usage });
@@ -614,7 +628,6 @@ pub async fn aggregate(mut stream: EventStream, capture: &UsageCapture) -> Aggre
       stop: StopKind::EndTurn,
       usage: Usage::default(),
       error_message: None,
-      completed: false,
    };
    let mut walker = Walker::new(capture.clone());
    while let Some(event) = stream.next().await {
@@ -666,7 +679,6 @@ impl Aggregated {
          Step::Stop { kind, usage } => {
             self.stop = kind;
             self.usage = usage;
-            self.completed = true;
          },
          Step::Failed { message, .. } => {
             self.error_message = Some(message);
@@ -693,13 +705,13 @@ mod tests {
       let sig = encode_signature(Some("rs_1"), "SECRET");
       assert_eq!(
          decode_signature(&sig),
-         (Some("rs_1".into()), Some("SECRET".into()))
+         (Some("rs_1".into()), "SECRET".into())
       );
       let sig_no_id = encode_signature(None, "SECRET");
-      assert_eq!(decode_signature(&sig_no_id), (None, Some("SECRET".into())));
+      assert_eq!(decode_signature(&sig_no_id), (None, "SECRET".into()));
       assert_eq!(
          decode_signature("not-base64-json"),
-         (None, Some("not-base64-json".into()))
+         (None, "not-base64-json".into())
       );
    }
 }

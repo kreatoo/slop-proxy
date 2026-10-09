@@ -451,7 +451,10 @@ fn fleet_reports(conn: &Connection, user: &str, now: i64) -> Result<Vec<UserQuot
          WHEN 'pro' THEN 20.0 WHEN 'prolite' THEN 5.0 ELSE 1.0 END AS plan_weight
       FROM quota_epochs e JOIN accounts a ON a.id = e.account_id
       WHERE e.resets_at > ?2 AND a.provider = 'openai'
-         AND (a.allowed_users = '' OR length(a.allowed_users) - length(replace(a.allowed_users, ',', '')) >= 1)
+         AND NOT (
+            length(trim(a.allowed_users, ' ,')) > 0
+            AND instr(trim(a.allowed_users, ' ,'), ',') = 0
+         )
          AND NOT EXISTS (SELECT 1 FROM quota_epochs newer WHERE newer.account_id = e.account_id
             AND newer.window_seconds = e.window_seconds AND newer.resets_at > e.resets_at)
    ), windows AS (
@@ -1239,7 +1242,7 @@ mod tests {
       })
       .unwrap();
       db.flush().await.unwrap();
-      assert_eq!(db.remove_account(&id.to_string()).await.unwrap(), 1);
+      assert_eq!(db.remove_account(id).await.unwrap(), 1);
       db.call(move |conn| {
          for table in [
             "quota_epochs",

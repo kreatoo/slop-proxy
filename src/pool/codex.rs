@@ -3,21 +3,57 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use futures_util::{StreamExt as _, stream};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{
-   AccountUsage, AuthPolicy, Backend, Cooldown, Pool, PoolError, Route, Slot, UsageWindow,
-   window_seconds,
-};
 use crate::clock::unix_now;
 use crate::codex::client::{CodexClient, RateLimit};
 use crate::codex::models::{ModelInfo, ModelsResponse, ServiceTier};
+use crate::codex::turn_state::{self, TurnState};
 use crate::codex::types::ErrorEnvelope;
 use crate::codex::websocket::Connection;
 use crate::db::quota::QuotaObservation;
+use crate::pool::{
+   AccountUsage, AuthPolicy, Backend, Cooldown, Pool, PoolError, Route, Served, Slot, UsageWindow,
+   window_seconds,
+};
 use crate::provider::Provider;
 use crate::upstream::SendError;
+
+#[derive(Default, Deserialize)]
+struct RateLimitEvent {
+   metered_limit_name: Option<String>,
+   limit_name: Option<String>,
+   #[serde(default)]
+   rate_limits: RateLimitsIn,
+}
+
+#[derive(Default, Deserialize)]
+struct RateLimitsIn {
+   primary: Option<WindowIn>,
+   secondary: Option<WindowIn>,
+}
+
+#[derive(Deserialize)]
+struct WindowIn {
+   window_minutes: Option<i64>,
+   used_percent: Option<f64>,
+   reset_at: Option<i64>,
+}
+
+#[derive(Default, Serialize)]
+struct RateLimitsOut {
+   primary: Option<WindowOut>,
+   secondary: Option<WindowOut>,
+}
+
+#[derive(Serialize)]
+struct WindowOut {
+   used_percent: f64,
+   window_minutes: i64,
+   reset_at: Option<i64>,
+}
 
 /// Session-sticky pool over codex accounts, owning the backend client.
 pub type CodexPool = Pool<CodexClient>;
@@ -31,6 +67,8 @@ const CATALOG_TTL: i64 = 300;
 #[derive(Clone)]
 pub enum Call {
    Http { body: Bytes, headers: HeaderMap },
+   Search { body: Bytes, headers: HeaderMap },
+   Get(String),
    WebSocket(HeaderMap),
 }
 
@@ -48,9 +86,6 @@ impl Backend for CodexClient {
    const ON_AUTH: AuthPolicy = AuthPolicy::RefreshOnce;
    const TIERED: bool = true;
    const SESSION_AFFINITY: bool = true;
-   /// A capacity refusal cools the account for 60s and the same model
-   /// refuses again after the wait, so a bound session moves on instead.
-   const BOUND_WAIT_SECS: i64 = 0;
    type Request = Call;
    type Response = Reply;
 
@@ -85,16 +120,29 @@ impl Backend for CodexClient {
             )
             .await
             .map(Reply::Http),
-         Call::WebSocket(ref headers) => self
-            .connect_websocket(
+         Call::Search {
+            ref body,
+            ref headers,
+         } => self
+            .search(
                token,
                &slot.provider_account_id,
+               body,
                &session,
                route.model,
                headers,
             )
             .await
-            .map(|connection| Reply::WebSocket(Box::new(connection))),
+            .map(Reply::Http),
+         Call::Get(ref path) => self
+            .get(token, &slot.provider_account_id, path)
+            .await
+            .map(Reply::Http),
+         Call::WebSocket(ref headers) => {
+            connect_pinned(self, slot, token, &session, route.model, headers)
+               .await
+               .map(|connection| Reply::WebSocket(Box::new(connection)))
+         },
       }
    }
 
@@ -117,20 +165,68 @@ impl Backend for CodexClient {
    }
 }
 
+/// Dials with the account's cleanest turn-state in place of the caller's, and
+/// falls back to the caller's once the backend refuses it, so a stale pin
+/// costs a handshake rather than a cooled account.
+async fn connect_pinned(
+   client: &CodexClient,
+   slot: &Slot,
+   token: &str,
+   session: &str,
+   model: &str,
+   headers: &HeaderMap,
+) -> Result<Connection, SendError> {
+   let pinned = match TurnState::from_headers(headers) {
+      Some(presented) if client.pins_turn_state() => slot.preferred_turn_state(&presented).await,
+      _ => None,
+   };
+   let Some(pinned) = pinned else {
+      return dial(client, slot, token, session, model, headers).await;
+   };
+   let Ok(value) = HeaderValue::from_str(&pinned.token) else {
+      return dial(client, slot, token, session, model, headers).await;
+   };
+   let mut swapped = headers.clone();
+   swapped.insert(turn_state::HEADER, value);
+   match dial(client, slot, token, session, model, &swapped).await {
+      Ok(connection) => Ok(connection),
+      Err(err) => {
+         tracing::warn!(
+            account = %slot.display,
+            blocks = pinned.blocks,
+            error = %err,
+            "backend refused the pinned codex turn-state, dialling with the caller's"
+         );
+         slot.refuse_turn_state().await;
+         dial(client, slot, token, session, model, headers).await
+      },
+   }
+}
+
+/// One handshake, boxed, so the relay loop's future does not carry it inline.
+async fn dial(
+   client: &CodexClient,
+   slot: &Slot,
+   token: &str,
+   session: &str,
+   model: &str,
+   headers: &HeaderMap,
+) -> Result<Connection, SendError> {
+   Box::pin(client.connect_websocket(token, &slot.provider_account_id, session, model, headers))
+      .await
+}
+
 impl Pool<CodexClient> {
-   pub async fn websocket_failed(&self, account_id: Option<i64>) {
-      if let Some(id) = account_id
-         && let Some(slot) = self.slots.by_id(id).await
-      {
-         self.slots.cool_failure(&slot).await;
+   pub async fn websocket_failed(&self, account_id: Option<i64>, why: &str) {
+      if let Some(slot) = self.slot(account_id).await {
+         self.slots.cool_failure(&slot, why).await;
       }
    }
 
    /// The 60s refusal cooldown walks back into the same wall, and `ranked`
    /// keeps the account first off a quota figure the backend stopped honouring.
    pub async fn websocket_exhausted(&self, account_id: Option<i64>) {
-      let Some(id) = account_id else { return };
-      let Some(slot) = self.slots.by_id(id).await else {
+      let Some(slot) = self.slot(account_id).await else {
          return;
       };
       let now = unix_now();
@@ -148,11 +244,17 @@ impl Pool<CodexClient> {
    }
 
    pub async fn websocket_completed(&self, account_id: Option<i64>) {
-      if let Some(id) = account_id
-         && let Some(slot) = self.slots.by_id(id).await
-      {
+      if let Some(slot) = self.slot(account_id).await {
          self.slots.mark_ok(&slot).await;
       }
+   }
+
+   /// Keeps the cleanest turn-state token an account's handshakes have returned.
+   pub async fn note_turn_state(&self, account_id: Option<i64>, observed: TurnState) {
+      let Some(slot) = self.slot(account_id).await else {
+         return;
+      };
+      self.slots.note_turn_state(&slot, observed).await;
    }
 
    pub async fn rewrite_rate_limits(
@@ -162,35 +264,34 @@ impl Pool<CodexClient> {
       pinned_account: Option<i64>,
       event: &mut Value,
    ) {
-      let limit = event
-         .get("metered_limit_name")
-         .and_then(Value::as_str)
-         .or_else(|| event.get("limit_name").and_then(Value::as_str))
+      let reading = RateLimitEvent::deserialize(&*event).unwrap_or_default();
+      let limit = reading
+         .metered_limit_name
+         .as_deref()
+         .or(reading.limit_name.as_deref())
          .map(str::trim)
          .filter(|name| !name.is_empty())
          .unwrap_or("codex")
          .to_ascii_lowercase()
          .replace('-', "_");
       let named_limit = (limit != "codex").then_some(limit.as_str());
-      let windows = ["primary", "secondary"]
+      let windows = [reading.rate_limits.primary, reading.rate_limits.secondary]
          .into_iter()
-         .filter_map(|tier| {
-            let window = event.get("rate_limits")?.get(tier)?;
-            let minutes = window.get("window_minutes")?.as_i64()?;
+         .filter_map(|window| {
+            let window = window?;
+            let minutes = window.window_minutes?;
             if minutes <= 0 || minutes.checked_mul(60).is_none() {
                return None;
             }
-            let percent = window.get("used_percent")?.as_f64()?;
+            let percent = window.used_percent?;
             (percent.is_finite() && percent >= 0.0_f64).then(|| UsageWindow {
                name: window_name(minutes),
                utilization: percent / 100.0,
-               resets_at: window.get("reset_at").and_then(Value::as_i64),
+               resets_at: window.reset_at,
             })
          })
          .collect();
-      if let Some(id) = account_id
-         && let Some(slot) = self.slots.by_id(id).await
-      {
+      if let Some(slot) = self.slot(account_id).await {
          self
             .slots
             .note_limit_windows(&slot, named_limit, windows)
@@ -198,18 +299,21 @@ impl Pool<CodexClient> {
       }
       let mut pooled = self.pool_windows(user, pinned_account, named_limit).await;
       pooled.sort_by_key(|window| window_seconds(&window.name).unwrap_or(i64::MAX));
-      let mut limits = json!({ "primary": null, "secondary": null });
-      for (tier, window) in ["primary", "secondary"].into_iter().zip(pooled) {
+      let mut limits = RateLimitsOut::default();
+      for (tier, window) in [&mut limits.primary, &mut limits.secondary]
+         .into_iter()
+         .zip(pooled)
+      {
          let Some(seconds) = window_seconds(&window.name) else {
             continue;
          };
-         limits[tier] = json!({
-            "used_percent": window.utilization * 100.0_f64,
-            "window_minutes": seconds / 60,
-            "reset_at": window.resets_at,
+         *tier = Some(WindowOut {
+            used_percent: window.utilization * 100.0_f64,
+            window_minutes: seconds / 60,
+            reset_at: window.resets_at,
          });
       }
-      event["rate_limits"] = limits;
+      event["rate_limits"] = serde_json::to_value(limits).unwrap_or_default();
       if let Some(event) = event.as_object_mut() {
          event.remove("credits");
          event.remove("plan_type");
@@ -221,34 +325,73 @@ impl Pool<CodexClient> {
       route: Route<'_>,
       body: Bytes,
       headers: HeaderMap,
-   ) -> Result<(Option<i64>, reqwest::Response), PoolError> {
-      if route.explicit_tier().is_some() {
-         self.catalogs(route.user, route.pinned_account).await?;
-      }
-      let (account, reply) = self.execute(route, Call::Http { body, headers }).await?;
-      match reply {
-         Reply::Http(response) => Ok((account, response)),
-         Reply::WebSocket(_) => Err(PoolError::Upstream("unexpected WebSocket reply".into())),
-      }
+   ) -> Result<Served<reqwest::Response>, PoolError> {
+      self
+         .dispatch(route, Call::Http { body, headers }, |reply| match reply {
+            Reply::Http(response) => Ok(response),
+            Reply::WebSocket(_) => Err(PoolError::Upstream("unexpected WebSocket reply".into())),
+         })
+         .await
+   }
+
+   pub async fn search(
+      &self,
+      route: Route<'_>,
+      body: Bytes,
+      headers: HeaderMap,
+   ) -> Result<Served<reqwest::Response>, PoolError> {
+      self
+         .dispatch(route, Call::Search { body, headers }, |reply| match reply {
+            Reply::Http(response) => Ok(response),
+            Reply::WebSocket(_) => Err(PoolError::Upstream("unexpected WebSocket reply".into())),
+         })
+         .await
+   }
+
+   pub async fn get(
+      &self,
+      route: Route<'_>,
+      path: String,
+   ) -> Result<Served<reqwest::Response>, PoolError> {
+      self
+         .dispatch(route, Call::Get(path), |reply| match reply {
+            Reply::Http(response) => Ok(response),
+            Reply::WebSocket(_) => Err(PoolError::Upstream("unexpected WebSocket reply".into())),
+         })
+         .await
    }
 
    pub async fn websocket(
       &self,
       route: Route<'_>,
       headers: HeaderMap,
-   ) -> Result<(Option<i64>, Connection), PoolError> {
+   ) -> Result<Served<Connection>, PoolError> {
+      self
+         .dispatch(route, Call::WebSocket(headers), |reply| match reply {
+            Reply::WebSocket(connection) => Ok(*connection),
+            Reply::Http(_) => Err(PoolError::Upstream("unexpected HTTP reply".into())),
+         })
+         .await
+   }
+
+   async fn dispatch<T>(
+      &self,
+      route: Route<'_>,
+      call: Call,
+      unwrap: fn(Reply) -> Result<T, PoolError>,
+   ) -> Result<Served<T>, PoolError> {
+      if let Some(retry_after) = self.fleet_quota_retry_after(route).await? {
+         return Err(PoolError::UserQuotaExceeded { retry_after });
+      }
       if route.explicit_tier().is_some() {
          self.catalogs(route.user, route.pinned_account).await?;
       }
-      let (account, reply) = self.execute(route, Call::WebSocket(headers)).await?;
-      match reply {
-         Reply::WebSocket(connection) => Ok((account, *connection)),
-         Reply::Http(_) => Err(PoolError::Upstream("unexpected HTTP reply".into())),
-      }
-   }
-
-   pub const fn client(&self) -> &CodexClient {
-      self.backend()
+      let served = self.execute(route, call).await?;
+      Ok(Served {
+         account_id: served.account_id,
+         response: unwrap(served.response)?,
+         attempts: served.attempts,
+      })
    }
 
    /// Only successful main-meter polling feeds attribution. Header and socket
@@ -318,31 +461,18 @@ impl Pool<CodexClient> {
                let healthy = !usage.rate_limit.limit_reached
                   && windows.iter().all(|window| window.utilization < 1.0_f64);
                let now = unix_now();
-               match self
+               self
                   .slots
                   .clear_cooldown_if(&slot, |until| healthy && until - now > EXHAUSTED_COOLDOWN)
-                  .await
-               {
-                  Ok(true) => tracing::info!(
-                     account = %slot.display,
-                     "cleared a cooldown the account's own quota no longer justifies"
-                  ),
-                  Ok(false) => {},
-                  Err(err) => tracing::warn!(
-                     account = %slot.display,
-                     error = %err,
-                     "failed to clear an obsolete codex cooldown"
-                  ),
-               }
+                  .await;
                self
                   .slots
                   .note_usage(
                      &slot,
                      AccountUsage {
                         windows,
-                        model_windows: Vec::new(),
                         locked: usage.rate_limit.limit_reached,
-                        observed_at: 0,
+                        ..AccountUsage::default()
                      },
                   )
                   .await;
@@ -367,6 +497,7 @@ impl Pool<CodexClient> {
             user,
             pinned_account,
             prefer_trusted: true,
+            reserved_only: false,
             five_hour_limit: None,
             weekly_limit: None,
          })
@@ -378,16 +509,6 @@ impl Pool<CodexClient> {
          }
       }
       usable
-   }
-
-   pub async fn any_active_credentials(&self) -> Option<(String, String)> {
-      for slot in self.listing_slots("", None).await {
-         let Ok(access) = self.slots.fresh_token(&slot, false).await else {
-            continue;
-         };
-         return Some((access, slot.provider_account_id.clone()));
-      }
-      None
    }
 
    pub async fn list_models(&self) -> Result<Vec<ModelInfo>, PoolError> {
@@ -498,10 +619,7 @@ impl Pool<CodexClient> {
          return Ok(true);
       };
       self.catalogs(route.user, route.pinned_account).await?;
-      let Some(id) = account_id else {
-         return Ok(false);
-      };
-      let Some(slot) = self.slots.by_id(id).await else {
+      let Some(slot) = self.slot(account_id).await else {
          return Ok(false);
       };
       Ok(slot.serves(route.user)
@@ -532,9 +650,7 @@ fn usage_from_headers(headers: &HeaderMap) -> Option<AccountUsage> {
    }
    (!windows.is_empty()).then_some(AccountUsage {
       windows,
-      model_windows: Vec::new(),
-      locked: false,
-      observed_at: 0,
+      ..AccountUsage::default()
    })
 }
 

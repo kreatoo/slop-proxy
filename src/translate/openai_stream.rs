@@ -2,13 +2,13 @@ use std::mem;
 
 use serde::Serialize;
 
-use super::chat::{
+use crate::clock::unix_now;
+use crate::codex::types::ResponsesEvent;
+use crate::translate::chat::{
    ChatChoice, ChatChunk, ChatCompletion, ChatContent, ChatDelta, ChatError, ChatErrorBody,
    ChatMessage, ChatToolCall, ChatUsage, ChunkChoice, FinishReason, FunctionBody,
 };
-use super::{Aggregated, Block, BlockEvent, Step, StopKind, UsageCapture, Walker};
-use crate::clock::unix_now;
-use crate::codex::types::ResponsesEvent;
+use crate::translate::{Aggregated, Block, BlockEvent, Step, UsageCapture, Walker};
 
 pub struct OpenAiStream {
    model: String,
@@ -33,14 +33,6 @@ where
    T: Serialize,
 {
    serde_json::to_string(&payload).expect("chunk serializes")
-}
-
-const fn finish_reason(kind: StopKind) -> FinishReason {
-   match kind {
-      StopKind::ToolUse => FinishReason::ToolCalls,
-      StopKind::MaxTokens => FinishReason::Length,
-      StopKind::EndTurn | StopKind::Error => FinishReason::Stop,
-   }
 }
 
 fn error_chunk(message: String) -> String {
@@ -90,14 +82,14 @@ impl OpenAiStream {
             if let Some(id) = id {
                self.id = format!("chatcmpl-{id}");
             }
-            out.push(self.chunk(
+            out.push(to_json(self.chunk(
                ChatDelta {
                   role: Some("assistant".into()),
                   content: Some(String::new()),
                   ..Default::default()
                },
                None,
-            ));
+            )));
          },
          Step::Block {
             event: BlockEvent::Open(Block::Text { .. }),
@@ -117,7 +109,7 @@ impl OpenAiStream {
             let index = self.tool_count;
             self.tool_count += 1;
             self.blocks.push(Channel::Call(index));
-            out.push(self.chunk(
+            out.push(to_json(self.chunk(
                ChatDelta {
                   tool_calls: Some(vec![ChatToolCall {
                      index: Some(index),
@@ -132,7 +124,7 @@ impl OpenAiStream {
                   ..Default::default()
                },
                None,
-            ));
+            )));
          },
          Step::Block {
             index,
@@ -160,19 +152,17 @@ impl OpenAiStream {
                   }]);
                },
             }
-            out.push(self.chunk(delta, None));
+            out.push(to_json(self.chunk(delta, None)));
          },
          Step::Stop { kind, usage } => {
-            out.push(self.chunk(ChatDelta::default(), Some(finish_reason(kind))));
+            out.push(to_json(
+               self.chunk(ChatDelta::default(), Some(kind.chat_finish_reason())),
+            ));
             if self.include_usage {
                out.push(to_json(ChatChunk {
-                  id: self.id.clone(),
-                  object: "chat.completion.chunk".into(),
-                  created: self.created,
-                  model: self.model.clone(),
                   choices: Vec::new(),
                   usage: Some(ChatUsage::from(&usage)),
-                  error: None,
+                  ..self.chunk(ChatDelta::default(), None)
                }));
             }
          },
@@ -181,8 +171,8 @@ impl OpenAiStream {
       }
    }
 
-   fn chunk(&self, delta: ChatDelta, finish_reason: Option<FinishReason>) -> String {
-      to_json(ChatChunk {
+   fn chunk(&self, delta: ChatDelta, finish_reason: Option<FinishReason>) -> ChatChunk {
+      ChatChunk {
          id: self.id.clone(),
          object: "chat.completion.chunk".into(),
          created: self.created,
@@ -195,7 +185,7 @@ impl OpenAiStream {
          }],
          usage: None,
          error: None,
-      })
+      }
    }
 }
 
@@ -246,7 +236,7 @@ pub fn render_aggregated(agg: &Aggregated, model: &str) -> ChatCompletion {
             tool_calls: Some(tool_calls).filter(|calls| !calls.is_empty()),
             ..Default::default()
          },
-         finish_reason: Some(finish_reason(agg.stop)),
+         finish_reason: Some(agg.stop.chat_finish_reason()),
          logprobs: None,
       }],
       usage: Some(ChatUsage::from(&agg.usage)),

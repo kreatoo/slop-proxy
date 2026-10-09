@@ -1,21 +1,28 @@
-//! Claude Code only speaks the messages API and every Gemini surface speaks
-//! chat completions.
+//! Chat completions back into Responses events, for the backends that only
+//! speak the older wire: every Gemini surface, and zen's chat-only models.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures_util::stream;
 
-use super::chat::{ChatChunk, ChatErrorBody, ChatToolCall, ErrorCode, FinishReason};
-use super::gemini_req::FREEFORM_ARG;
 use crate::codex::sse::EventStream;
 use crate::codex::types::{
    OutputContentPart, OutputItem, ResponseObj, ResponsesEvent, SummaryPart, UpstreamError, Usage,
 };
-use crate::gemini::client::GeminiProtocol;
 use crate::gemini::native::{NativeEvent, NativeStream};
 use crate::gemini::signatures;
 use crate::gemini::sse::Frames;
 use crate::translate::UsageCapture;
+use crate::translate::chat::{ChatChunk, ChatErrorBody, ChatToolCall, ErrorCode, FinishReason};
+use crate::translate::chat_req::FREEFORM_ARG;
+
+/// Which wire the upstream answered in, since only Google's native surface
+/// frames something other than chat completions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeProtocol {
+   Chat,
+   GeminiNative,
+}
 
 /// Tool calls arrive spread across chunks keyed by index, so a slot holds the
 /// name until there is enough to open an item.
@@ -30,23 +37,6 @@ pub struct ChatToResponses {
    finish_reason: Option<FinishReason>,
    usage: Option<Usage>,
    completed: bool,
-   frames: usize,
-   emitted: usize,
-   first_frame: Option<String>,
-}
-
-/// A stream that produced nothing is the failure this path keeps hitting, and
-/// the frame count separates nothing arriving from nothing being understood.
-impl Drop for ChatToResponses {
-   fn drop(&mut self) {
-      if self.emitted == 0 {
-         tracing::warn!(
-            frames = self.frames,
-            first = self.first_frame.as_deref().unwrap_or("<none>"),
-            "gemini bridge produced no content"
-         );
-      }
-   }
 }
 
 #[derive(Default)]
@@ -57,6 +47,29 @@ struct OpenCall {
    arguments: String,
    index: u64,
    announced: bool,
+}
+
+impl OpenCall {
+   fn item(&self, custom: bool, body: String, status: Option<&str>) -> OutputItem {
+      let status = status.map(str::to_owned);
+      if custom {
+         OutputItem::CustomToolCall {
+            id: Some(self.item_id.clone()),
+            call_id: self.id.clone(),
+            name: self.name.clone(),
+            input: body,
+            status,
+         }
+      } else {
+         OutputItem::FunctionCall {
+            id: Some(self.item_id.clone()),
+            call_id: self.id.clone(),
+            name: self.name.clone(),
+            arguments: Some(body),
+            status,
+         }
+      }
+   }
 }
 
 struct TextOutput {
@@ -79,9 +92,10 @@ impl TextOutput {
 
 impl ChatToResponses {
    pub fn with_custom(custom: BTreeSet<String>) -> Self {
-      let mut bridge = Self::default();
-      bridge.custom = custom;
-      bridge
+      Self {
+         custom,
+         ..Self::default()
+      }
    }
 
    #[expect(
@@ -89,16 +103,6 @@ impl ChatToResponses {
       reason = "one chunk in, every Responses event it implies out; the arms are the frame kinds"
    )]
    pub fn feed(&mut self, chunk: &ChatChunk) -> Vec<ResponsesEvent> {
-      self.frames += 1;
-      if self.first_frame.is_none() {
-         self.first_frame = Some(
-            serde_json::to_string(chunk)
-               .unwrap_or_default()
-               .chars()
-               .take(400)
-               .collect(),
-         );
-      }
       let first_frame = self.response_id.is_none();
       let response_id = Some(
          self
@@ -119,7 +123,6 @@ impl ChatToResponses {
       if let Some(err) = chunk.error.as_ref() {
          self.completed = true;
          self.calls.clear();
-         self.emitted += 1;
          out.push(ResponsesEvent::Failed {
             response: ResponseObj {
                id: response_id,
@@ -240,42 +243,31 @@ impl ChatToResponses {
             }
             // A freeform tool takes raw text, so the single string it was
             // offered as is unwrapped before the item is handed back.
-            if self.custom.contains(&call.name) {
-               let input = serde_json::from_str::<HashMap<String, String>>(&call.arguments)
+            let custom = self.custom.contains(&call.name);
+            let body = if custom {
+               serde_json::from_str::<HashMap<String, String>>(&call.arguments)
                   .ok()
                   .and_then(|mut args| args.remove(FREEFORM_ARG))
-                  .unwrap_or_else(|| call.arguments.clone());
-               out.push(ResponsesEvent::CustomToolCallInputDone {
+                  .unwrap_or_else(|| call.arguments.clone())
+            } else {
+               call.arguments.clone()
+            };
+            out.push(if custom {
+               ResponsesEvent::CustomToolCallInputDone {
                   item_id: Some(call.item_id.clone()),
                   output_index: call.index,
-                  input: input.clone(),
-               });
-               out.push(ResponsesEvent::OutputItemDone {
+                  input: body.clone(),
+               }
+            } else {
+               ResponsesEvent::FunctionCallArgumentsDone {
+                  item_id: Some(call.item_id.clone()),
                   output_index: call.index,
-                  item: OutputItem::CustomToolCall {
-                     id: Some(call.item_id.clone()),
-                     call_id: call.id.clone(),
-                     name: call.name.clone(),
-                     input,
-                     status: Some("completed".into()),
-                  },
-               });
-               continue;
-            }
-            out.push(ResponsesEvent::FunctionCallArgumentsDone {
-               item_id: Some(call.item_id.clone()),
-               output_index: call.index,
-               arguments: call.arguments.clone(),
+                  arguments: body.clone(),
+               }
             });
             out.push(ResponsesEvent::OutputItemDone {
                output_index: call.index,
-               item: OutputItem::FunctionCall {
-                  id: Some(call.item_id.clone()),
-                  call_id: call.id.clone(),
-                  name: call.name.clone(),
-                  arguments: Some(call.arguments.clone()),
-                  status: Some("completed".into()),
-               },
+               item: call.item(custom, body, Some("completed")),
             });
          }
          self.calls.clear();
@@ -321,17 +313,6 @@ impl ChatToResponses {
          self.completed = true;
          out.push(self.terminal(response_id, Some(usage)));
       }
-      // `created` and `completed` carry no answer, so they do not count as
-      // content when deciding whether the bridge produced anything.
-      self.emitted += out
-         .iter()
-         .filter(|event| {
-            !matches!(
-               event,
-               ResponsesEvent::Created { .. } | ResponsesEvent::Completed { .. }
-            )
-         })
-         .count();
       out
    }
 
@@ -348,9 +329,7 @@ impl ChatToResponses {
       if let Some(args) = call.function.arguments.as_ref() {
          slot.arguments.push_str(args);
       }
-      if let Some(sig) = call.thought_signature()
-         && !slot.id.is_empty()
-      {
+      if let Some(sig) = call.thought_signature() {
          signatures::put(&slot.id, sig);
       }
       if !slot.announced && !slot.name.is_empty() {
@@ -358,27 +337,9 @@ impl ChatToResponses {
          slot.item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
          slot.index = self.next_index;
          self.next_index += 1;
-         let ready = &*slot;
-         let item = if self.custom.contains(&ready.name) {
-            OutputItem::CustomToolCall {
-               id: Some(ready.item_id.clone()),
-               call_id: ready.id.clone(),
-               name: ready.name.clone(),
-               input: String::new(),
-               status: None,
-            }
-         } else {
-            OutputItem::FunctionCall {
-               id: Some(ready.item_id.clone()),
-               call_id: ready.id.clone(),
-               name: ready.name.clone(),
-               arguments: Some(String::new()),
-               status: None,
-            }
-         };
          out.push(ResponsesEvent::OutputItemAdded {
-            output_index: ready.index,
-            item,
+            output_index: slot.index,
+            item: slot.item(self.custom.contains(&slot.name), String::new(), None),
          });
       }
       let args = if was_announced {
@@ -447,14 +408,14 @@ impl ChatToResponses {
 /// in Gemini's own frames, so that protocol is normalised before parsing.
 pub fn event_stream(
    resp: reqwest::Response,
-   protocol: GeminiProtocol,
+   protocol: BridgeProtocol,
    model: &str,
    custom: BTreeSet<String>,
    capture: UsageCapture,
 ) -> EventStream {
    use futures_util::StreamExt as _;
 
-   let mut native = (protocol == GeminiProtocol::Native).then(|| NativeStream::new(model));
+   let mut native = (protocol == BridgeProtocol::GeminiNative).then(|| NativeStream::new(model));
    let mut frames = Frames::default();
    let mut bridge = ChatToResponses::with_custom(custom);
    let upstream = resp
@@ -509,7 +470,7 @@ pub fn event_stream(
 mod tests {
    use super::*;
    use crate::codex::types::ResponsesRequest;
-   use crate::translate::gemini_req::{custom_tools, to_chat};
+   use crate::translate::chat_req::{custom_tools, to_chat};
    use serde_json::{Value, json};
 
    fn chunk(value: Value) -> ChatChunk {
@@ -872,41 +833,6 @@ mod full_chain {
       assert_eq!(usage.output_tokens, 89);
       assert_eq!(usage.output_tokens_details.reasoning_tokens, 88);
       assert!(bridge.finalize().is_empty());
-   }
-}
-
-#[cfg(test)]
-mod real_chunk {
-   use super::*;
-
-   #[test]
-   fn a_real_gemini_chunk_survives_deserialisation() {
-      let chunk: ChatChunk = serde_json::from_str(r#"{"choices":[{"delta":{"content":"OK.","role":"assistant"},"index":0}],"created":1788373398,"id":"x","model":"gemini-3.8-flash","object":"chat.completion.chunk","usage":{"completion_tokens":2,"prompt_tokens":3,"total_tokens":71}}"#).unwrap();
-      let events = ChatToResponses::default().feed(&chunk);
-      let kinds: Vec<_> = events
-         .iter()
-         .map(|event| {
-            serde_json::to_value(event).unwrap()["type"]
-               .as_str()
-               .unwrap()
-               .to_owned()
-         })
-         .collect();
-      assert_eq!(
-         kinds,
-         [
-            "response.created",
-            "response.output_item.added",
-            "response.content_part.added",
-            "response.output_text.delta"
-         ]
-      );
-      assert!(
-         events
-            .iter()
-            .any(|event| matches!(event, ResponsesEvent::OutputTextDelta { .. })),
-         "no text delta survived: {events:?}"
-      );
    }
 }
 

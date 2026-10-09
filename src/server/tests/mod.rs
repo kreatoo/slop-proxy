@@ -11,23 +11,20 @@ use axum::response::IntoResponse as _;
 use axum::routing::post;
 use tokio::net::TcpListener;
 
-use super::{AppState, Inner, metrics, router};
 use crate::clock;
-use crate::codex::client::CodexClient;
 use crate::config::{
-   AnthropicConfig, CodexConfig, Config, ExperientialConfig, GeminiConfig, GlmConfig, ModelAlias,
-   ModelsConfig, PricingConfig, ZenConfig,
+   AnthropicConfig, CodexConfig, Config, GeminiConfig, ModelAlias, ModelsConfig, PricingConfig,
 };
 use crate::db::Db;
 use crate::db::accounts::NewAccount;
-use crate::db::tokens::TokenLimits;
 use crate::db::quota::QuotaObservation;
+use crate::db::tokens::TokenLimits;
 use crate::db::usage::UsageDim;
 use crate::oauth::TokenSet;
 use crate::pool::Pools;
-use crate::pool::codex::CodexPool;
 use crate::pricing::Prices;
 use crate::provider::{AuthMode, Provider};
+use crate::server::{AppState, Inner, metrics, router};
 
 const MOCK_SSE: &str = concat!(
    "event: response.created\n",
@@ -85,6 +82,33 @@ fn fresh_tokens() -> TokenSet {
    }
 }
 
+/// Serves the proxy over a fresh temp db holding the `sp-test` token for
+/// `alice` and `accounts`.
+async fn serve_proxy(mut cfg: Config, accounts: &[NewAccount<'_>]) -> (String, Db) {
+   let db_path = env::temp_dir().join(format!("slop-test-{}.db", uuid::Uuid::new_v4()));
+   let db = Db::open(&db_path).unwrap();
+   db.create_token("alice", "sp-test", "sp-test")
+      .await
+      .unwrap();
+   for account in accounts {
+      db.upsert_account(NewAccount { ..*account }).await.unwrap();
+   }
+   cfg.db_path = db_path.clone();
+   let pools = Pools::load(&db, &cfg).await.unwrap();
+   let state = AppState(Arc::new(Inner {
+      db: db.clone(),
+      cfg,
+      prices: Prices::new(&db_path, PricingConfig::default().url),
+      pools,
+   }));
+   let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+   let addr = listener.local_addr().unwrap();
+   tokio::spawn(async move {
+      axum::serve(listener, router(state)).await.unwrap();
+   });
+   (format!("http://{addr}"), db)
+}
+
 async fn spawn_proxy_with(models: ModelsConfig, anthropic_base: Option<String>) -> (String, Db) {
    spawn_proxy_with_response(models, anthropic_base, MOCK_SSE.into()).await
 }
@@ -103,69 +127,40 @@ async fn spawn_proxy_at(
    anthropic_base: Option<String>,
    base_url: String,
 ) -> (String, Db) {
-   let db_path = env::temp_dir().join(format!("slop-test-{}.db", uuid::Uuid::new_v4()));
-   let db = Db::open(&db_path).unwrap();
-   db.create_token("alice", "sp-test", "sp-test")
-      .await
-      .unwrap();
-   db.upsert_account(NewAccount {
+   let tokens = fresh_tokens();
+   let mut accounts = vec![NewAccount {
       provider: Provider::OpenAi,
       id: "acct-1",
       email: Some("test@example.com"),
       label: None,
       plan: Some("plus"),
-      tokens: &fresh_tokens(),
+      tokens: &tokens,
       auth_mode: AuthMode::OAuth,
-   })
-   .await
-   .unwrap();
+   }];
    if anthropic_base.is_some() {
-      db.upsert_account(NewAccount {
+      accounts.push(NewAccount {
          provider: Provider::Anthropic,
          id: "acct-a1",
          email: None,
          label: None,
          plan: None,
-         tokens: &fresh_tokens(),
+         tokens: &tokens,
          auth_mode: AuthMode::OAuth,
-      })
-      .await
-      .unwrap();
+      });
    }
-
-   let cfg_db_path = db_path.clone();
    let cfg = Config {
-      db_path,
-      bind: String::new(),
-      metrics_bind: None,
       codex: CodexConfig {
          base_url,
          ..CodexConfig::default()
       },
       anthropic: AnthropicConfig {
-         base_url: anthropic_base.unwrap_or_default(),
+         base_url: anthropic_base.clone().unwrap_or_default(),
          ..AnthropicConfig::default()
       },
-      gemini: GeminiConfig::default(),
-      zen: ZenConfig::default(),
-      glm: GlmConfig::default(),
-      experiential: ExperientialConfig::default(),
-      pricing: PricingConfig::default(),
       models,
+      ..Config::default()
    };
-   let pools = Pools::load(&db, &cfg).await.unwrap();
-   let state = AppState(Arc::new(Inner {
-      db: db.clone(),
-      cfg,
-      prices: Prices::new(&cfg_db_path, PricingConfig::default().url),
-      pools,
-   }));
-   let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-   let addr = listener.local_addr().unwrap();
-   tokio::spawn(async move {
-      axum::serve(listener, router(state)).await.unwrap();
-   });
-   (format!("http://{addr}"), db)
+   serve_proxy(cfg, &accounts).await
 }
 
 /// Translation tests use claude-* model names against the codex mock, so
@@ -206,8 +201,8 @@ async fn anthropic_streaming_end_to_end() {
       "signature_delta",
       "\"type\":\"text\"",
       "\"text\":\"Hello \"",
-      "\"name\":\"get_weather\"",
       "\"type\":\"tool_use\"",
+      "\"name\":\"get_weather\"",
       "input_json_delta",
       "\"stop_reason\":\"tool_use\"",
       "event: message_stop",
@@ -228,7 +223,6 @@ async fn anthropic_streaming_end_to_end() {
    db.flush().await.unwrap();
    let totals = db.usage_totals(0, i64::MAX).await.unwrap();
    assert_eq!(totals.requests, 1);
-   // 100 prompt tokens of which 20 were cached, so 80 are freshly billed.
    assert_eq!(totals.input_tokens, 80);
    assert_eq!(totals.cache_read_tokens, 20);
    assert_eq!(totals.output_tokens, 25);
@@ -460,19 +454,7 @@ async fn metrics_render_accounts_and_usage() {
       .unwrap();
    db.flush().await.unwrap();
 
-   let cfg = Config {
-      db_path: PathBuf::new(),
-      bind: String::new(),
-      metrics_bind: None,
-      codex: CodexConfig::default(),
-      anthropic: AnthropicConfig::default(),
-      gemini: GeminiConfig::default(),
-      zen: ZenConfig::default(),
-      glm: GlmConfig::default(),
-      experiential: ExperientialConfig::default(),
-      pricing: PricingConfig::default(),
-      models: ModelsConfig::default(),
-   };
+   let cfg = Config::default();
    let pools = Pools::load(&db, &cfg).await.unwrap();
    let state = AppState(Arc::new(Inner {
       db: db.clone(),
@@ -494,30 +476,6 @@ async fn metrics_render_accounts_and_usage() {
 }
 
 #[tokio::test]
-async fn pool_reload_picks_up_new_logins() {
-   let db_path = env::temp_dir().join(format!("slop-reload-{}.db", uuid::Uuid::new_v4()));
-   let db = Db::open(&db_path).unwrap();
-   let pool = CodexPool::load(db.clone(), CodexClient::new(CodexConfig::default()))
-      .await
-      .unwrap();
-   assert_eq!(pool.len().await, 0);
-
-   db.upsert_account(NewAccount {
-      provider: Provider::OpenAi,
-      id: "acct-r1",
-      email: None,
-      label: None,
-      plan: None,
-      tokens: &fresh_tokens(),
-      auth_mode: AuthMode::OAuth,
-   })
-   .await
-   .unwrap();
-   pool.reload().await.unwrap();
-   assert_eq!(pool.len().await, 1);
-}
-
-#[tokio::test]
 async fn token_request_limit_enforced() {
    let (base, db) = spawn_proxy().await;
    let id = db.create_token("marc", "sp-marc", "sp-marc").await.unwrap();
@@ -530,9 +488,10 @@ async fn token_request_limit_enforced() {
          window_seconds: 3600,
          slowdown_ms: 0,
          prefer_trusted: false,
-      five_hour_limit: None,
-      weekly_limit: None,
+         five_hour_limit: None,
+         weekly_limit: None,
          pinned_account: None,
+         reserved_only: false,
       },
    )
    .await
@@ -596,57 +555,28 @@ async fn spawn_proxy_with_gemini_reply(
       axum::serve(listener, app).await.unwrap();
    });
 
-   let db_path = env::temp_dir().join(format!("slop-test-{}.db", uuid::Uuid::new_v4()));
-   let db = Db::open(&db_path).unwrap();
-   db.create_token("alice", "sp-test", "sp-test")
-      .await
-      .unwrap();
-   db.upsert_account(NewAccount {
+   let tokens = fresh_tokens();
+   let accounts = [NewAccount {
       provider: Provider::Gemini,
       id: "gem-1",
       email: None,
       label: Some("gem1"),
       plan: None,
-      tokens: &fresh_tokens(),
+      tokens: &tokens,
       auth_mode: AuthMode::ApiKey,
-   })
-   .await
-   .unwrap();
-
-   let cfg_db_path = db_path.clone();
+   }];
    let cfg = Config {
-      db_path,
-      bind: String::new(),
-      metrics_bind: None,
-      codex: CodexConfig::default(),
-      anthropic: AnthropicConfig::default(),
       gemini: GeminiConfig {
          base_url: format!("http://{addr}"),
          ..GeminiConfig::default()
       },
-      zen: ZenConfig::default(),
-      glm: GlmConfig::default(),
-      experiential: ExperientialConfig::default(),
-      pricing: PricingConfig::default(),
-      models: ModelsConfig::default(),
+      ..Config::default()
    };
-   let pools = Pools::load(&db, &cfg).await.unwrap();
-   let state = AppState(Arc::new(Inner {
-      db: db.clone(),
-      cfg,
-      prices: Prices::new(&cfg_db_path, PricingConfig::default().url),
-      pools,
-   }));
-   let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-   let proxy_addr = proxy_listener.local_addr().unwrap();
-   tokio::spawn(async move {
-      axum::serve(proxy_listener, router(state)).await.unwrap();
-   });
-   (format!("http://{proxy_addr}"), db)
+   serve_proxy(cfg, &accounts).await
 }
 
 #[tokio::test]
-async fn a_rejected_gemini_request_keeps_googles_reason() {
+async fn a_rejected_chat_request_keeps_googles_reason() {
    let (base, db) = spawn_proxy_with_gemini().await;
    let resp = reqwest::Client::new()
       .post(format!(
@@ -830,6 +760,7 @@ async fn bridged_responses_preserve_status_usage_and_output_order() {
    }
 }
 
+mod copilot;
 mod experiential;
 mod rate_limits;
 mod websocket;

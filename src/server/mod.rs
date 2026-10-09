@@ -1,6 +1,9 @@
 pub mod anthropic;
 pub mod auth;
+mod cache;
+pub mod chat;
 pub mod clientcfg;
+pub mod copilot;
 pub mod decompress;
 pub mod error;
 pub mod facts;
@@ -13,6 +16,7 @@ pub mod relay;
 mod tests;
 pub mod usage;
 
+use std::mem;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,6 +70,7 @@ impl AppState {
 
 pub async fn serve(db: Db, cfg: Config, bind: &str) -> Result<()> {
    let pools = Pools::load(&db, &cfg).await?;
+   pools.refresh_catalogs().await;
    let prices = Prices::new(&cfg.db_path, cfg.pricing.url.clone());
    prices.load().await;
    let state = AppState(Arc::new(Inner {
@@ -74,16 +79,25 @@ pub async fn serve(db: Db, cfg: Config, bind: &str) -> Result<()> {
       prices,
       pools,
    }));
-   price_history(&state).await;
    let price_state = state.clone();
    tokio::spawn(async move {
-      let mut tick = time::interval(Duration::from_secs(12 * 60 * 60));
+      price_history(&price_state).await;
+      let mut tick = time::interval(Duration::from_hours(12));
       tick.tick().await;
       loop {
          tick.tick().await;
          if price_state.prices.refresh().await.is_ok() {
             price_history(&price_state).await;
          }
+      }
+   });
+   let catalog_state = state.clone();
+   tokio::spawn(async move {
+      let mut tick = time::interval(Duration::from_mins(5));
+      tick.tick().await;
+      loop {
+         tick.tick().await;
+         catalog_state.pools.refresh_catalogs().await;
       }
    });
    let reload_state = state.clone();
@@ -95,6 +109,7 @@ pub async fn serve(db: Db, cfg: Config, bind: &str) -> Result<()> {
       loop {
          tick.tick().await;
          reload_state.pools.reload().await;
+         reload_state.pools.refresh_egresses(&reload_state.cfg);
          reload_state.pools.poll_usage().await;
       }
    });
@@ -141,14 +156,14 @@ async fn price_history(state: &AppState) {
    let table = state.prices.table();
    let priced: Vec<_> = rows
       .iter()
-      .map(|row| {
-         (
-            row.id,
-            state.prices.cost(&row.model, row.tokens),
-            table.list_cost(&row.model, row.tokens),
-         )
+      .filter_map(|row| {
+         let cost = state.prices.cost(&row.model, row.tokens);
+         let list_cost = table.list_cost(&row.model, row.tokens);
+         let billable = cost > 0.0_f64 || list_cost > 0.0_f64;
+         let changed =
+            cost.to_bits() != row.cost.to_bits() || list_cost.to_bits() != row.list_cost.to_bits();
+         (billable && changed).then_some((row.id, cost, list_cost))
       })
-      .filter(|&(_, ref cost, ref list_cost)| *cost > 0.0_f64 || *list_cost > 0.0_f64)
       .collect();
    if priced.is_empty() {
       return;
@@ -166,10 +181,17 @@ pub fn router(state: AppState) -> Router {
       .route("/v1/chat/completions", post(openai::chat_completions))
       .route("/v1/models", get(openai::models))
       .route("/v1/usage", get(usage::usage))
+      .route("/v1/alpha/search", post(openai::search))
+      .route("/v1/cache/{session}", get(cache::status))
       .route("/v1beta/models", get(gemini::models))
       .route("/v1beta/models/{spec}", post(gemini::native))
       .route("/config/codex/auth.json", get(clientcfg::codex_auth))
       .route("/config/codex/config.toml", get(clientcfg::codex_config))
+      .route("/backend-api/aura/site_status", get(openai::backend_get))
+      .route(
+         "/backend-api/wham/accounts/check",
+         get(clientcfg::codex_accounts),
+      )
       .route(
          "/v1/responses",
          post(openai::responses_passthrough).get(openai::websocket::responses),
@@ -183,23 +205,12 @@ pub fn router(state: AppState) -> Router {
       .with_state(state)
 }
 
-/// Reasoning tokens are a subset of the output the provider already billed,
-/// so they are deliberately absent here.
-const fn billable(record: &UsageRecord) -> Tokens {
-   Tokens {
-      input: record.input_tokens,
-      output: record.output_tokens,
-      cache_read: record.cache_read_tokens,
-      cache_write: record.cache_write_tokens,
-   }
-}
-
 /// Logs the request on drop, so client disconnects mid-stream still get a row.
 pub struct LogGuard {
    state: AppState,
    capture: UsageCapture,
    record: UsageRecord,
-   start: Instant,
+   started: Instant,
 }
 
 impl LogGuard {
@@ -216,16 +227,16 @@ impl LogGuard {
          state,
          capture,
          record,
-         start: started,
+         started,
       }
    }
 }
 
 impl Drop for LogGuard {
    fn drop(&mut self) {
-      let mut record = self.record.clone();
+      let mut record = mem::take(&mut self.record);
       let cap = self.capture.snapshot();
-      pipeline::apply_snapshot(&mut record, &cap, self.start);
+      pipeline::apply_snapshot(&mut record, &cap, self.started);
       let finished = cap.completed || cap.stop_reason.is_some();
       if !finished && record.error_kind.is_none() {
          record.error_kind = Some(if cap.upstream_eof {
@@ -243,7 +254,9 @@ impl Drop for LogGuard {
              kind = record.error_kind.as_deref().unwrap_or("?"),
              last_event = cap.last_event.as_deref().unwrap_or("none"),
              upstream_head = cap.upstream_head.as_deref().unwrap_or(""),
-             after_ms = self.start.elapsed().as_millis() as i64,
+             after_ms = self.started.elapsed().as_millis() as i64,
+             idle_ms = cap.last_byte_at.map_or(-1, |last| last.elapsed().as_millis() as i64),
+             egress = cap.egress.map_or(-1, |index| index as i64),
              "stream ended without usage"
          );
       }
@@ -278,9 +291,15 @@ pub fn log_error(state: &AppState, mut record: UsageRecord, status: i64, kind: &
    write_usage(&state.db, record);
 }
 
-/// Both write paths price a row
 fn price(prices: &Prices, record: &mut UsageRecord) {
-   let billable = billable(record);
+   // Reasoning tokens are a subset of the output the provider already billed,
+   // so they are deliberately absent here.
+   let billable = Tokens {
+      input: record.input_tokens,
+      output: record.output_tokens,
+      cache_read: record.cache_read_tokens,
+      cache_write: record.cache_write_tokens,
+   };
    record.cost_usd = prices.cost(&record.upstream_model, billable);
    record.list_cost_usd = prices.table().list_cost(&record.upstream_model, billable);
 }
@@ -302,7 +321,7 @@ pub fn cache_key(user: &str, req: &ResponsesRequest) -> String {
    hasher.update(user.as_bytes());
    hasher.update(&req.instructions);
    if let Some(first) = req.input.first() {
-      hasher.update(serde_json::to_string(first).unwrap_or_default());
+      hasher.update(serde_json::to_string(first).expect("a Value always serializes"));
    }
    let digest = hasher.finalize();
    let mut bytes = [0_u8; 16];
@@ -310,26 +329,4 @@ pub fn cache_key(user: &str, req: &ResponsesRequest) -> String {
    uuid::Builder::from_random_bytes(bytes)
       .into_uuid()
       .to_string()
-}
-
-#[cfg(test)]
-mod end_reason_tests {
-   use crate::translate::UsageCapture;
-
-   #[test]
-   fn the_two_ways_a_stream_dies_are_distinguishable() {
-      let cut_by_client = UsageCapture::default();
-      cut_by_client.note_event("response.output_text.delta");
-      let snap = cut_by_client.snapshot();
-      assert!(!snap.completed && !snap.upstream_eof);
-      assert_eq!(
-         snap.last_event.as_deref(),
-         Some("response.output_text.delta")
-      );
-
-      let cut_by_upstream = UsageCapture::default();
-      cut_by_upstream.note_upstream_eof();
-      let upstream_snap = cut_by_upstream.snapshot();
-      assert!(!upstream_snap.completed && upstream_snap.upstream_eof);
-   }
 }

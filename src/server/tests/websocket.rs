@@ -613,7 +613,6 @@ async fn websocket_estimated_user_quota_rechecks_existing_socket_and_handshake()
    socket.close(None).await.unwrap();
 }
 
-
 #[tokio::test]
 async fn websocket_estimated_usd_budget_rechecks_existing_socket_and_handshake() {
    let (base, db, mut requests, _) = mock().await;
@@ -634,8 +633,20 @@ async fn websocket_estimated_usd_budget_rechecks_existing_socket_and_handshake()
       send(&mut socket, request).await;
       let error = event(&mut socket).await;
       assert_eq!(error["status"], 429_i32);
-      assert!(error["headers"]["retry-after"].as_str().unwrap().parse::<i64>().unwrap() >= 60);
-      assert!(error["error"]["message"].as_str().unwrap().contains("estimated USD budget"));
+      assert!(
+         error["headers"]["retry-after"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            >= 60
+      );
+      assert!(
+         error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("estimated USD budget")
+      );
       requests.try_recv().unwrap_err();
    }
    let Err(Error::Http(rejected)) = connect_async(upgrade_request(&base)).await else {
@@ -650,6 +661,9 @@ async fn websocket_estimated_usd_budget_rechecks_existing_socket_and_handshake()
    )
    .await;
    assert_eq!(event(&mut socket).await["type"], "response.completed");
-   assert_eq!(requests.recv().await.unwrap()["model"], "gpt-5.3-codex-spark");
+   assert_eq!(
+      requests.recv().await.unwrap()["model"],
+      "gpt-5.3-codex-spark"
+   );
    socket.close(None).await.unwrap();
 }
